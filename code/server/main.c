@@ -9,7 +9,9 @@
 #include <linux/limits.h>
 
 #define ACCOUNTS_DIR "/userdata/accounts"
-#define VM_BASE "/userdata/base/debian-rootfs"
+
+// Base RootFS im Projektordner
+#define VM_BASE_REL "/vm/base/debian-rootfs"
 #define KERNEL_PATH "/userdata/kernel/vmlinuz"
 #define INITRD_PATH "/userdata/kernel/initrd.img"
 
@@ -61,41 +63,24 @@ void showHelp() {
 // ------------------------------
 void createUser() {
     // Prüfen, ob Base RootFS existiert
-    DIR *baseDir = opendir(VM_BASE);
-    if (!baseDir) {
-        printf("Base RootFS does not exist!\n");
-        printf("Do you want to download/create it now? (y/n) [y]: ");
+    char exePath[PATH_MAX];
+    char basePath[PATH_MAX];
 
-        char answer[10];
-        fgets(answer, sizeof(answer), stdin);
-
-        if (answer[0] == '\n') answer[0] = 'y';
-
-        if (answer[0] == 'y' || answer[0] == 'Y') {
-            char exePath[PATH_MAX];
-            char setupPath[PATH_MAX];
-
-            if (readlink("/proc/self/exe", exePath, sizeof(exePath)) == -1) {
-                perror("readlink");
-                return;
-            }
-            exePath[sizeof(exePath)-1] = 0;
-
-            strncpy(setupPath, dirname(exePath), sizeof(setupPath));
-            strncat(setupPath, "/setup.sh", sizeof(setupPath) - strlen(setupPath) - 1);
-
-            if (system(setupPath) != 0) {
-                printf("Error: Failed to create Base RootFS.\n");
-                return;
-            }
-            printf("Base RootFS created successfully.\n");
-        } else {
-            printf("Aborted. Cannot create account without Base RootFS.\n");
-            return;
-        }
-    } else {
-        closedir(baseDir);
+    if (readlink("/proc/self/exe", exePath, sizeof(exePath)) == -1) {
+        perror("readlink");
+        return;
     }
+    exePath[sizeof(exePath)-1] = 0;
+
+    snprintf(basePath, sizeof(basePath), "%s/%s", dirname(exePath), VM_BASE_REL);
+
+    DIR *baseDir = opendir(basePath);
+    if (!baseDir) {
+        printf("Base RootFS not found in '%s'\n", basePath);
+        printf("Please make sure it exists.\n");
+        return;
+    }
+    closedir(baseDir);
 
     char name[50];
     printf("Enter new account name: ");
@@ -121,7 +106,7 @@ void createUser() {
     }
 
     // RootFS kopieren
-    snprintf(cmd, sizeof(cmd), "cp -r %s %s/rootfs", VM_BASE, accountPath);
+    snprintf(cmd, sizeof(cmd), "cp -r %s %s/rootfs", basePath, accountPath);
     if (system(cmd) != 0) {
         printf("Error: Failed to copy base rootfs for account '%s'\n", name);
         return;
@@ -231,8 +216,8 @@ void menu() {
 
 // ------------------------------
 int main() {
+    // Ordner für Accounts anlegen, falls nicht existiert
     system("mkdir -p /userdata/accounts");
-    system("mkdir -p /userdata/base");
 
     menu();
     return 0;
