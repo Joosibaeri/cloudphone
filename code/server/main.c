@@ -25,7 +25,6 @@ void listAccounts() {
     printf("Available accounts:\n");
 
     while ((entry = readdir(dp))) {
-        // skip . and ..
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
 
@@ -42,9 +41,22 @@ void listAccounts() {
 }
 
 // ------------------------------
+// Show help
+// ------------------------------
+void showHelp() {
+    printf("\nAvailable commands:\n");
+    printf("startvm   - Start a VM\n");
+    printf("stopvm    - Stop all VMs\n");
+    printf("list      - List accounts\n");
+    printf("createvm  - Create new account\n");
+    printf("help      - Show this help\n");
+    printf("exit      - Exit terminal\n\n");
+}
+
+// ------------------------------
 // Create new VM account
 // ------------------------------
-void createAccount() {
+void createVM() {
     char name[50];
     printf("Enter new account name: ");
     scanf("%s", name);
@@ -52,22 +64,25 @@ void createAccount() {
     char accountPath[256];
     snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
 
-    // Check if account exists
     DIR *dir = opendir(accountPath);
     if (dir) {
-        printf("Account '%s' already exists!\n", name);
+        printf("Error: Account '%s' already exists!\n", name);
         closedir(dir);
         return;
     }
 
-    // Make directories
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "mkdir -p %s/rootfs", accountPath);
-    system(cmd);
+    if (system(cmd) != 0) {
+        printf("Error: Failed to create directory for account '%s'\n", name);
+        return;
+    }
 
-    // Copy base rootfs
     snprintf(cmd, sizeof(cmd), "cp -r %s %s/rootfs", VM_BASE, accountPath);
-    system(cmd);
+    if (system(cmd) != 0) {
+        printf("Error: Failed to copy base rootfs for account '%s'\n", name);
+        return;
+    }
 
     printf("Account '%s' created successfully!\n", name);
 }
@@ -85,7 +100,7 @@ int selectAccount(char *accountName) {
 
     DIR *dir = opendir(path);
     if (!dir) {
-        printf("Account '%s' does not exist!\n", accountName);
+        printf("Error: Account '%s' does not exist!\n", accountName);
         return 0;
     }
     closedir(dir);
@@ -100,7 +115,6 @@ void startVM() {
     if (!selectAccount(accountName))
         return;
 
-    // Simple deterministic SSH port based on account name
     int port = 2200;
     for (int i = 0; accountName[i] != '\0'; i++) {
         port += accountName[i];
@@ -119,48 +133,49 @@ void startVM() {
              "&",
              KERNEL_PATH, INITRD_PATH, port, ACCOUNTS_DIR, accountName);
 
-    printf("Starting VM for '%s' on SSH port %d...\n", accountName, port);
-    system(cmd);
+    if (system(cmd) != 0) {
+        printf("Error: Failed to start VM for '%s'\n", accountName);
+        return;
+    }
+
+    printf("VM for '%s' started on SSH port %d\n", accountName, port);
 }
 
 // ------------------------------
 // Stop all VMs
 // ------------------------------
-void stopVMs() {
-    printf("Stopping all running VMs...\n");
-    system("pkill qemu-system-x86_64");
+void stopVM() {
+    if (system("pkill qemu-system-x86_64") != 0) {
+        printf("Error: Failed to stop VMs or none running.\n");
+        return;
+    }
+    printf("All VMs stopped.\n");
 }
 
 // ------------------------------
 // Menu
 // ------------------------------
 void menu() {
-    int choice;
-    while (1) {
-        printf("\nCloudPhone Server Terminal\n");
-        printf("==========================\n");
-        printf("1) Start VM\n");
-        printf("2) Stop all VMs\n");
-        printf("3) List accounts\n");
-        printf("4) Create new account\n");
-        printf("5) Exit\n");
-        printf("Enter choice: ");
-        scanf("%d", &choice);
+    char input[50];
 
-        switch (choice) {
-            case 1: startVM(); break;
-            case 2: stopVMs(); break;
-            case 3: listAccounts(); break;
-            case 4: createAccount(); break;
-            case 5: exit(0);
-            default: printf("Unknown command.\n");
-        }
+    printf("For help type 'help'\n");
+
+    while (1) {
+        printf("\n> ");
+        scanf("%s", input);
+
+        if (strcmp(input, "startvm") == 0) startVM();
+        else if (strcmp(input, "stopvm") == 0) stopVM();
+        else if (strcmp(input, "list") == 0) listAccounts();
+        else if (strcmp(input, "createvm") == 0) createVM();
+        else if (strcmp(input, "help") == 0) showHelp();
+        else if (strcmp(input, "exit") == 0) exit(0);
+        else printf("Error: Unknown command '%s'. Type 'help' for available commands.\n", input);
     }
 }
 
 // ------------------------------
 int main() {
-    // Ensure account directory exists
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "mkdir -p %s", ACCOUNTS_DIR);
     system(cmd);
@@ -168,4 +183,3 @@ int main() {
     menu();
     return 0;
 }
-
