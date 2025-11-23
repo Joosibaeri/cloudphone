@@ -5,27 +5,23 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <limits.h>
-#include <libgen.h>
 #include <linux/limits.h>
 
 #define ACCOUNTS_DIR "/userdata/accounts"
-
-// Base RootFS im Projektordner
 #define VM_BASE_QCOW2 "/vm/base/debian.qcow2"
 #define VM_BASE_ROOTFS "/vm/base/debian-rootfs.img"
 #define KERNEL_PATH "/userdata/kernel/vmlinuz"
 #define INITRD_PATH "/userdata/kernel/initrd.img"
 
-// ------------------------------
-// Download Base Image if missing
-// ------------------------------
+void flushInput() {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+}
+
 void ensureBaseImage() {
     DIR *d = opendir("/vm/base");
-    if (!d) {
-        system("mkdir -p /vm/base");
-    } else {
-        closedir(d);
-    }
+    if (!d) system("mkdir -p /vm/base");
+    else closedir(d);
 
     if (access(VM_BASE_QCOW2, F_OK) != 0) {
         printf("Base RootFS not found. Downloading...\n");
@@ -42,9 +38,7 @@ void ensureBaseImage() {
     if (access(VM_BASE_ROOTFS, F_OK) != 0) {
         printf("Preparing Base RootFS...\n");
         char cmd[1024];
-        snprintf(cmd, sizeof(cmd),
-                 "cp %s %s",
-                 VM_BASE_QCOW2, VM_BASE_ROOTFS);
+        snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_QCOW2, VM_BASE_ROOTFS);
         if (system(cmd) != 0) {
             printf("Error: Failed to prepare Base RootFS\n");
             exit(1);
@@ -52,9 +46,6 @@ void ensureBaseImage() {
     }
 }
 
-// ------------------------------
-// List all accounts
-// ------------------------------
 void listAccounts() {
     struct dirent *entry;
     DIR *dp = opendir(ACCOUNTS_DIR);
@@ -63,76 +54,67 @@ void listAccounts() {
         return;
     }
 
-    int index = 1;
     printf("Available accounts:\n");
+    int index = 1;
 
     while ((entry = readdir(dp))) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-            continue;
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
 
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", ACCOUNTS_DIR, entry->d_name);
 
         struct stat st;
-        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
             printf("%d) %s\n", index++, entry->d_name);
-        }
     }
 
     closedir(dp);
 }
 
-// ------------------------------
-// Show help
-// ------------------------------
 void showHelp() {
     printf("\nAvailable commands:\n");
-    printf("startvm    - Start a VM\n");
-    printf("stopvm     - Stop all VMs\n");
-    printf("list       - List accounts\n");
-    printf("createuser - Create new account\n");
-    printf("help       - Show this help\n");
-    printf("exit       - Exit terminal\n\n");
+    printf("startvm     - Start a VM\n");
+    printf("stopvm      - Stop all VMs\n");
+    printf("listuser    - List accounts\n");
+    printf("createuser  - Create new account\n");
+    printf("removeuser  - Delete an account\n");
+    printf("help        - Show this help\n");
+    printf("exit        - Exit terminal\n\n");
+    printf("checkuser   - Check if an account exists\n");
 }
 
-// ------------------------------
-// Create new user account
-// ------------------------------
 void createUser() {
     char name[50];
     printf("Enter new account name: ");
     fgets(name, sizeof(name), stdin);
-    name[strcspn(name, "\n")] = 0;  // newline entfernen
+    name[strcspn(name, "\n")] = 0;
 
     char accountPath[256];
     snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
 
     DIR *dir = opendir(accountPath);
     if (dir) {
-        printf("Error: Account '%s' already exists!\n", name);
         closedir(dir);
+        printf("Error: Account '%s' already exists!\n", name);
         return;
     }
 
-    if (system(NULL)) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "mkdir -p %s", accountPath);
-        if (system(cmd) != 0) {
-            printf("Error: Failed to create account directory\n");
-            return;
-        }
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", accountPath);
+
+    if (system(cmd) != 0) {
+        printf("Error: Failed to create account directory\n");
+        return;
     }
 
-    printf("Account '%s' created successfully!\n", name);
+    printf("Account '%s' created.\n", name);
 }
 
-// ------------------------------
-// Select an existing account
-// ------------------------------
 int selectAccount(char *accountName) {
     listAccounts();
     printf("Enter account name: ");
-    scanf("%s", accountName);
+    scanf("%49s", accountName);
+    flushInput();
 
     char path[256];
     snprintf(path, sizeof(path), "%s/%s", ACCOUNTS_DIR, accountName);
@@ -146,25 +128,37 @@ int selectAccount(char *accountName) {
     return 1;
 }
 
-// ------------------------------
-// Start a VM for a given account
-// ------------------------------
+void checkUser() {
+    char name[50];
+    printf("Enter account name to check: ");
+    scanf("%49s", name);
+    flushInput();
+
+    char accountPath[256];
+    snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
+
+    DIR *dir = opendir(accountPath);
+    if (dir) {
+        closedir(dir);
+        printf("Account '%s' exists.\n", name);
+    } else {
+        printf("Account '%s' does not exist.\n", name);
+    }
+}
+
 void startVM() {
     ensureBaseImage();
 
     char accountName[50];
-    if (!selectAccount(accountName))
-        return;
+    if (!selectAccount(accountName)) return;
 
-    // Prüfen ob Account RootFS existiert, sonst Base kopieren
     char rootfsPath[PATH_MAX];
     snprintf(rootfsPath, sizeof(rootfsPath), "%s/%s/rootfs.img", ACCOUNTS_DIR, accountName);
 
     if (access(rootfsPath, F_OK) != 0) {
         printf("Account '%s' rootfs not found. Copying Base-Image...\n", accountName);
-        char cmd[PATH_MAX*2];
-        snprintf(cmd, sizeof(cmd),
-                 "cp %s %s", VM_BASE_ROOTFS, rootfsPath);
+        char cmd[PATH_MAX * 2];
+        snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_ROOTFS, rootfsPath);
         if (system(cmd) != 0) {
             printf("Error: Failed to copy base rootfs for '%s'\n", accountName);
             return;
@@ -172,9 +166,7 @@ void startVM() {
     }
 
     int port = 2200;
-    for (int i = 0; accountName[i] != '\0'; i++) {
-        port += accountName[i];
-    }
+    for (int i = 0; accountName[i]; i++) port += accountName[i];
 
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
@@ -196,9 +188,6 @@ void startVM() {
     printf("VM for '%s' started on SSH port %d\n", accountName, port);
 }
 
-// ------------------------------
-// Stop all VMs
-// ------------------------------
 void stopVM() {
     if (system("pkill qemu-system-x86_64") != 0) {
         printf("Error: Failed to stop VMs or none running.\n");
@@ -207,34 +196,68 @@ void stopVM() {
     printf("All VMs stopped.\n");
 }
 
-// ------------------------------
-// Menu
-// ------------------------------
+void removeUser() {
+    char name[50];
+    printf("Enter account name to delete: ");
+    scanf("%49s", name);
+    flushInput();
+
+    char accountPath[256];
+    snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
+
+    DIR *dir = opendir(accountPath);
+    if (!dir) {
+        printf("Error: Account '%s' does not exist!\n", name);
+        return;
+    }
+    closedir(dir);
+
+    char confirm[4];
+    printf("Are you sure you want to delete '%s'? (y/n): ", name);
+    scanf("%3s", confirm);
+    flushInput();
+
+    if (strcmp(confirm, "y") != 0) {
+        printf("Aborted.\n");
+        return;
+    }
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", accountPath);
+
+    if (system(cmd) != 0) {
+        printf("Error: Failed to delete account '%s'\n", name);
+        return;
+    }
+
+    printf("Account '%s' deleted.\n", name);
+}
+
 void menu() {
     char input[50];
-
     printf("For help type 'help'\n");
 
     while (1) {
         printf("\n> ");
         fgets(input, sizeof(input), stdin);
-        input[strcspn(input, "\n")] = 0;  // newline entfernen
+        input[strcspn(input, "\n")] = 0;
 
-        if (strcmp(input, "startvm") == 0) startVM();
-        else if (strcmp(input, "stopvm") == 0) stopVM();
-        else if (strcmp(input, "list") == 0) listAccounts();
-        else if (strcmp(input, "createuser") == 0) createUser();
-        else if (strcmp(input, "help") == 0) showHelp();
-        else if (strcmp(input, "exit") == 0) exit(0);
+        if (!strcmp(input, "startvm")) startVM();
+        else if (!strcmp(input, "stopvm")) stopVM();
+        else if (!strcmp(input, "listuser")) listAccounts();
+        else if (!strcmp(input, "createuser")) createUser();
+        else if (!strcmp(input, "removeuser")) removeUser();
+        else if (!strcmp(input, "help")) showHelp();
+        else if (!strcmp(input, "exit")) exit(0);
+        else if (!strcmp(input, "checkuser")) checkUser();
+        
+        else if (strlen(input) == 0) continue;
         else printf("Error: Unknown command '%s'. Type 'help' for available commands.\n", input);
     }
 }
 
-// ------------------------------
 int main() {
-    // Ordner für Accounts anlegen, falls nicht existiert
     system("mkdir -p /userdata/accounts");
-
     menu();
     return 0;
 }
