@@ -73,14 +73,18 @@ void listAccounts() {
 
 void showHelp() {
     printf("\nAvailable commands:\n");
-    printf("startvm     - Start a VM\n");
-    printf("stopvm      - Stop all VMs\n");
-    printf("listuser    - List accounts\n");
-    printf("createuser  - Create new account\n");
-    printf("removeuser  - Delete an account\n");
-    printf("help        - Show this help\n");
-    printf("exit        - Exit terminal\n\n");
-    printf("checkuser   - Check if an account exists\n");
+    printf("startvm       - Start a VM\n");
+    printf("stopvm        - Stop all VMs\n");
+    printf("listuser      - List accounts\n");
+    printf("createuser    - Create new account\n");
+    printf("removeuser    - Delete an account\n");
+    printf("checkuser     - Check if an account exists\n");
+    printf("userinfo      - Show info about a user\n");
+    printf("cloneuser     - Clone an existing user\n");
+    printf("resetuser     - Reset a user's rootfs\n");
+    printf("rebuildbase   - Redownload the base rootfs\n");
+    printf("help          - Show this help\n");
+    printf("exit          - Exit terminal\n\n");
 }
 
 void createUser() {
@@ -126,24 +130,6 @@ int selectAccount(char *accountName) {
     }
     closedir(dir);
     return 1;
-}
-
-void checkUser() {
-    char name[50];
-    printf("Enter account name to check: ");
-    scanf("%49s", name);
-    flushInput();
-
-    char accountPath[256];
-    snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
-
-    DIR *dir = opendir(accountPath);
-    if (dir) {
-        closedir(dir);
-        printf("Account '%s' exists.\n", name);
-    } else {
-        printf("Account '%s' does not exist.\n", name);
-    }
 }
 
 void startVM() {
@@ -233,6 +219,122 @@ void removeUser() {
     printf("Account '%s' deleted.\n", name);
 }
 
+void checkUser() {
+    char name[50];
+    printf("Enter account name to check: ");
+    scanf("%49s", name);
+    flushInput();
+
+    char accountPath[256];
+    snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
+
+    DIR *dir = opendir(accountPath);
+    if (dir) {
+        closedir(dir);
+        printf("Account '%s' exists.\n", name);
+    } else {
+        printf("Account '%s' does not exist.\n", name);
+    }
+}
+
+void userInfo() {
+    char name[50];
+    printf("Enter account name: ");
+    scanf("%49s", name);
+    flushInput();
+
+    char accountPath[PATH_MAX];
+    snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
+
+    DIR *dir = opendir(accountPath);
+    if (!dir) {
+        printf("Account '%s' does not exist.\n", name);
+        return;
+    }
+    closedir(dir);
+
+    char rootfs[PATH_MAX];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs.img", accountPath);
+
+    int port = 2200;
+    for (int i = 0; name[i]; i++) port += name[i];
+
+    printf("User: %s\n", name);
+    printf("RootFS: %s\n", rootfs);
+    printf("SSH Port: %d\n", port);
+    printf("RootFS exists: %s\n", access(rootfs, F_OK) == 0 ? "yes" : "no");
+}
+
+void cloneUser() {
+    char src[50], dest[50];
+
+    printf("Enter source user: ");
+    scanf("%49s", src);
+    flushInput();
+
+    printf("Enter new user name: ");
+    scanf("%49s", dest);
+    flushInput();
+
+    char srcPath[PATH_MAX], destPath[PATH_MAX];
+    snprintf(srcPath, sizeof(srcPath), "%s/%s", ACCOUNTS_DIR, src);
+    snprintf(destPath, sizeof(destPath), "%s/%s", ACCOUNTS_DIR, dest);
+
+    DIR *dir = opendir(srcPath);
+    if (!dir) {
+        printf("Source user does not exist.\n");
+        return;
+    }
+    closedir(dir);
+
+    dir = opendir(destPath);
+    if (dir) {
+        closedir(dir);
+        printf("Destination user already exists.\n");
+        return;
+    }
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "cp -r %s %s", srcPath, destPath);
+    system(cmd);
+
+    printf("User '%s' cloned to '%s'.\n", src, dest);
+}
+
+void resetUser() {
+    char name[50];
+    printf("Enter account to reset: ");
+    scanf("%49s", name);
+    flushInput();
+
+    char rootfs[PATH_MAX];
+    snprintf(rootfs, sizeof(rootfs), "%s/%s/rootfs.img", ACCOUNTS_DIR, name);
+
+    if (access(rootfs, F_OK) == 0) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "rm %s", rootfs);
+        system(cmd);
+    }
+
+    printf("Copying fresh base rootfs...\n");
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_ROOTFS, rootfs);
+    system(cmd);
+
+    printf("User '%s' was reset.\n", name);
+}
+
+void rebuildBase() {
+    printf("Rebuilding base image...\n");
+
+    if (access(VM_BASE_QCOW2, F_OK) == 0) system("rm /vm/base/debian.qcow2");
+    if (access(VM_BASE_ROOTFS, F_OK) == 0) system("rm /vm/base/debian-rootfs.img");
+
+    ensureBaseImage();
+
+    printf("Base image rebuilt.\n");
+}
+
 void menu() {
     char input[50];
     printf("For help type 'help'\n");
@@ -247,10 +349,13 @@ void menu() {
         else if (!strcmp(input, "listuser")) listAccounts();
         else if (!strcmp(input, "createuser")) createUser();
         else if (!strcmp(input, "removeuser")) removeUser();
+        else if (!strcmp(input, "checkuser")) checkUser();
+        else if (!strcmp(input, "userinfo")) userInfo();
+        else if (!strcmp(input, "cloneuser")) cloneUser();
+        else if (!strcmp(input, "resetuser")) resetUser();
+        else if (!strcmp(input, "rebuildbase")) rebuildBase();
         else if (!strcmp(input, "help")) showHelp();
         else if (!strcmp(input, "exit")) exit(0);
-        else if (!strcmp(input, "checkuser")) checkUser();
-        
         else if (strlen(input) == 0) continue;
         else printf("Error: Unknown command '%s'. Type 'help' for available commands.\n", input);
     }
