@@ -8,8 +8,8 @@
 #include <linux/limits.h>
 
 #define ACCOUNTS_DIR "/userdata/accounts"
-#define VM_BASE_QCOW2 "/vm/base/arch.qcow2"
-#define VM_BASE_ROOTFS "/vm/base/arch-rootfs.img"
+#define VM_BASE_QCOW2   "/vm/base/arch.qcow2"
+#define VM_BASE_ROOTFS  "/vm/base/arch-rootfs.img"
 #define KERNEL_PATH "/userdata/kernel/vmlinuz"
 #define INITRD_PATH "/userdata/kernel/initrd.img"
 
@@ -22,34 +22,55 @@ void flushInput() {
 }
 
 // ----------------------------------
-// Ensure Base Image Exists
+// Ensure Base Image Exists (mit Arch-Download)
 // ----------------------------------
 void ensureBaseImage() {
     DIR *d = opendir("/vm/base");
     if (!d) system("mkdir -p /vm/base");
     else closedir(d);
 
-    if (access(VM_BASE_QCOW2, F_OK) != 0) {
-        printf("Base Arch RootFS not found. Downloading...\n");
+    // -----------------------------
+    // Automatisches Arch Linux Download & Entpack
+    // -----------------------------
+    struct stat buffer;
+    if (stat(VM_BASE_ROOTFS, &buffer) != 0) {
+        printf("Arch Base RootFS not found, downloading...\n");
         char cmd[1024];
         snprintf(cmd, sizeof(cmd),
-                 "wget -O %s https://ftp.fau.de/archlinux/images/latest/Arch-Linux-x86_64-cloudimg.qcow2",
-                 VM_BASE_QCOW2);
-        if (system(cmd) != 0) {
-            printf("Error: Failed to download Arch Base RootFS\n");
-            exit(1);
-        }
-    }
+                 "wget -O %s https://mirror.rackspace.com/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.gz",
+                 "/vm/base/arch-rootfs.tar.gz");
+        system(cmd);
 
-    if (access(VM_BASE_ROOTFS, F_OK) != 0) {
-        printf("Preparing Base RootFS...\n");
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_QCOW2, VM_BASE_ROOTFS);
-        if (system(cmd) != 0) {
-            printf("Error: Failed to prepare Arch Base RootFS\n");
-            exit(1);
-        }
+        snprintf(cmd, sizeof(cmd),
+                 "mkdir -p /vm/base/arch-rootfs && tar -xzf /vm/base/arch-rootfs.tar.gz -C /vm/base/arch-rootfs --strip-components=1");
+        system(cmd);
+
+        printf("Arch Base RootFS downloaded and prepared.\n");
     }
+    // -----------------------------
+
+    // Vorhandenes QCOW2/Image kopieren
+if (access(VM_BASE_QCOW2, F_OK) != 0) {
+    printf("Base Arch QCOW2 not found, downloading...\n");
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "wget -O %s https://ftp.fau.de/archlinux/images/latest/Arch-Linux-x86_64-cloudimg.qcow2",
+             VM_BASE_QCOW2);
+    if (system(cmd) != 0) {
+        printf("Error: Failed to download Arch Base QCOW2\n");
+        exit(1);
+    }
+}
+
+if (access(VM_BASE_ROOTFS, F_OK) != 0) {
+    printf("Preparing Base RootFS copy...\n");
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_QCOW2, VM_BASE_ROOTFS);
+    if (system(cmd) != 0) {
+        printf("Error: Failed to prepare Arch Base RootFS\n");
+        exit(1);
+    }
+}
 }
 
 // ----------------------------------
@@ -134,10 +155,10 @@ void createUser() {
 void removeUser() {
     char name[50];
     printf("Enter account name to delete: ");
-    scanf("%49s", name);
-    flushInput();
+    fgets(name, sizeof(name), stdin);
+    name[strcspn(name, "\n")] = 0;  // Zeilenumbruch entfernen
 
-    char accountPath[256];
+    char accountPath[PATH_MAX];
     snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
 
     DIR *dir = opendir(accountPath);
@@ -149,16 +170,16 @@ void removeUser() {
 
     char confirm[4];
     printf("Are you sure you want to delete '%s'? (y/n): ", name);
-    scanf("%3s", confirm);
-    flushInput();
+    fgets(confirm, sizeof(confirm), stdin);
+    confirm[strcspn(confirm, "\n")] = 0;
 
-    if (strcmp(confirm, "y") != 0) {
+    if (strcmp(confirm, "y") != 0 && strcmp(confirm, "Y") != 0) {
         printf("Aborted.\n");
         return;
     }
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", accountPath);
+    char cmd[PATH_MAX + 16];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", accountPath); // Pfad in Anführungszeichen für Sicherheit
     if (system(cmd) != 0) {
         printf("Error: Failed to delete account '%s'\n", name);
         return;
@@ -290,8 +311,8 @@ void resetUser() {
 void rebuildBase() {
     printf("Rebuilding base image...\n");
 
-    if (access(VM_BASE_QCOW2, F_OK) == 0) system("rm /vm/base/debian.qcow2");
-    if (access(VM_BASE_ROOTFS, F_OK) == 0) system("rm /vm/base/debian-rootfs.img");
+    if (access(VM_BASE_QCOW2, F_OK) == 0) system("rm /vm/base/arch.qcow2");
+    if (access(VM_BASE_ROOTFS, F_OK) == 0) system("rm /vm/base/arch-rootfs.img");
 
     ensureBaseImage();
 
@@ -334,24 +355,26 @@ void startVM() {
     if (access(rootfsPath, F_OK) != 0) {
         printf("Account '%s' rootfs not found. Copying Base-Image...\n", accountName);
         char cmd[PATH_MAX * 2];
-        snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_ROOTFS, rootfsPath);
+        snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", VM_BASE_ROOTFS, rootfsPath);
         if (system(cmd) != 0) {
-            printf("Error: Failed to copy base rootfs for '%s'\n", accountName);
+            perror("Fehler beim Kopieren des RootFS");
             return;
         }
     }
 
     int port = 2200;
     for (int i = 0; accountName[i]; i++) port += accountName[i];
+    port = (port % 64512) + 1024; // gültige Ports von 1024–65535
 
-    char cmd[1024];
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "qemu-system-x86_64 "
+             "nohup qemu-system-x86_64 "
              "-m 512M "
              "-boot c "
              "-nographic "
              "-net user,hostfwd=tcp::%d-:22 -net nic "
-             "-drive file=%s,format=qcow2,if=virtio &",
+             "-drive file='%s',format=qcow2,if=virtio "
+             "> /dev/null 2>&1 &",
              port, rootfsPath);
 
     if (system(cmd) != 0) {
@@ -359,7 +382,7 @@ void startVM() {
         return;
     }
 
-    printf("VM for '%s' started on SSH port %d\n", accountName, port);
+    printf("VM for '%s' started on SSH port %d (running in background with nohup)\n", accountName, port);
 }
 
 // ----------------------------------
