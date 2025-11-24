@@ -8,8 +8,8 @@
 #include <linux/limits.h>
 
 #define ACCOUNTS_DIR "/userdata/accounts"
-#define VM_BASE_QCOW2 "/vm/base/debian.qcow2"
-#define VM_BASE_ROOTFS "/vm/base/debian-rootfs.img"
+#define VM_BASE_QCOW2 "/vm/base/arch.qcow2"
+#define VM_BASE_ROOTFS "/vm/base/arch-rootfs.img"
 #define KERNEL_PATH "/userdata/kernel/vmlinuz"
 #define INITRD_PATH "/userdata/kernel/initrd.img"
 
@@ -30,13 +30,13 @@ void ensureBaseImage() {
     else closedir(d);
 
     if (access(VM_BASE_QCOW2, F_OK) != 0) {
-        printf("Base RootFS not found. Downloading...\n");
+        printf("Base Arch RootFS not found. Downloading...\n");
         char cmd[1024];
         snprintf(cmd, sizeof(cmd),
-                 "wget -O %s https://cdimage.debian.org/cdimage/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
+                 "wget -O %s https://ftp.fau.de/archlinux/images/latest/Arch-Linux-x86_64-cloudimg.qcow2",
                  VM_BASE_QCOW2);
         if (system(cmd) != 0) {
-            printf("Error: Failed to download Base RootFS\n");
+            printf("Error: Failed to download Arch Base RootFS\n");
             exit(1);
         }
     }
@@ -46,7 +46,7 @@ void ensureBaseImage() {
         char cmd[1024];
         snprintf(cmd, sizeof(cmd), "cp %s %s", VM_BASE_QCOW2, VM_BASE_ROOTFS);
         if (system(cmd) != 0) {
-            printf("Error: Failed to prepare Base RootFS\n");
+            printf("Error: Failed to prepare Arch Base RootFS\n");
             exit(1);
         }
     }
@@ -348,13 +348,11 @@ void startVM() {
     snprintf(cmd, sizeof(cmd),
              "qemu-system-x86_64 "
              "-m 512M "
-             "-kernel %s "
-             "-initrd %s "
-             "-append \"console=ttyS0 root=/dev/ram0 rw\" "
+             "-boot c "
              "-nographic "
              "-net user,hostfwd=tcp::%d-:22 -net nic "
-             "-drive file=%s,format=raw,if=virtio &",
-             KERNEL_PATH, INITRD_PATH, port, rootfsPath);
+             "-drive file=%s,format=qcow2,if=virtio &",
+             port, rootfsPath);
 
     if (system(cmd) != 0) {
         printf("Error: Failed to start VM for '%s'\n", accountName);
