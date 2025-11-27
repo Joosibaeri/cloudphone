@@ -16,14 +16,13 @@
 #include <fcntl.h>
 #include <signal.h>
 
-/* <signal.h> provides kill(); explicit extern declaration unnecessary */
+ 
 
 #define ACCOUNTS_DIR "/userdata/accounts"
 #define BASE_DIR        "/userdata/base"
 #define VM_BASE_QCOW2   "/userdata/base/base.qcow2"
 
-/* Prototypes */
-/* flushInput was removed */
+ 
 int selectAccount(char *accountName);
 int ensureBaseImage(void);
 int ensureAccountsFolder(void);
@@ -37,15 +36,14 @@ void resetUser(void);
 void rebuildBase(void);
 void startVM(void);
 void stopVM(void);
-/* changeimg: download/change base qcow2 image */
+ 
 void changeimg(void);
 int findFreePort(void);
-/* automation API removed previously; code now CLI-only */
+ 
 void showHelp(void);
 void menu(void);
 
-/* --- Helpers --- */
-/* flushInput was unused — removed */
+ 
 
 int selectAccount(char *accountName) {
     listAccounts();
@@ -63,7 +61,7 @@ int selectAccount(char *accountName) {
     return 1;
 }
 
-/* Ensure base directory and base image exist. Return 0 on success, -1 on error */
+ 
 int ensureBaseImage(void) {
     DIR *d = opendir(BASE_DIR);
     if (!d) {
@@ -86,7 +84,7 @@ int ensureBaseImage(void) {
     return 0;
 }
 
-/* --- Account operations --- */
+ 
 void listAccounts(void) {
     struct dirent *entry;
     DIR *dp = opendir(ACCOUNTS_DIR);
@@ -104,7 +102,7 @@ void listAccounts(void) {
     closedir(dp);
 }
 
-/* Ensure accounts folder exists. Return 0 on success */
+ 
 int ensureAccountsFolder(void) {
     DIR *d = opendir(ACCOUNTS_DIR);
     if (d) { closedir(d); return 0; }
@@ -112,7 +110,7 @@ int ensureAccountsFolder(void) {
     return 0;
 }
 
-/* minimal name validation: no slash and only safe characters */
+ 
 static int validateName(const char *name) {
     if (!name || !*name) return 0;
     if (strchr(name, '/')) return 0;
@@ -123,7 +121,7 @@ static int validateName(const char *name) {
     return 1;
 }
 
-/* copy file content; returns 0 on success */
+ 
 static int copyFile(const char *src, const char *dst) {
     int in = open(src, O_RDONLY);
     if (in < 0) return -1;
@@ -139,8 +137,7 @@ static int copyFile(const char *src, const char *dst) {
     return (r == 0) ? 0 : -1;
 }
 
-/* nftw callback to remove files/directories */
-/* recursively remove a file/directory (depth first). returns 0 on success */
+ 
 static int remove_recursive(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) { perror("lstat"); return -1; }
@@ -159,16 +156,16 @@ static int remove_recursive(const char *path) {
         if (rmdir(path) != 0) { perror("rmdir"); return -1; }
         return rc;
     }
-    /* if it's a symlink or file, unlink it (do not follow symlink) */
+    
     if (unlink(path) != 0) { perror("unlink"); return -1; }
     return 0;
 }
 
-/* recursively copy a file or directory from src -> dst (depth-first). Return 0 on success */
+ 
 static int copy_recursive(const char *src, const char *dst) {
     struct stat st;
     if (lstat(src, &st) != 0) { perror("lstat src"); return -1; }
-    /* handle symlink: recreate symlink at dst */
+    
     if (S_ISLNK(st.st_mode)) {
         char buf[PATH_MAX]; ssize_t r = readlink(src, buf, sizeof(buf)-1);
         if (r < 0) { perror("readlink"); return -1; }
@@ -193,7 +190,7 @@ static int copy_recursive(const char *src, const char *dst) {
         closedir(d);
         return rc;
     }
-    /* regular file: copy contents */
+    
     int in = open(src, O_RDONLY);
     if (in < 0) { perror("open src"); return -1; }
     int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
@@ -207,7 +204,7 @@ static int copy_recursive(const char *src, const char *dst) {
     return (r == 0) ? 0 : -1;
 }
 
-/* find a free TCP port on localhost; start searching at 2200 up to 65535. Return port or -1 */
+ 
 int findFreePort(void) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
@@ -255,7 +252,7 @@ void removeUser(void) {
     if (!fgets(name, sizeof(name), stdin)) return;
     name[strcspn(name, "\n")] = 0;
 
-    /* validate early to prevent asking for confirmation on invalid names */
+    
     if (!validateName(name)) { printf("Invalid account name\n"); return; }
 
     char accountPath[PATH_MAX]; snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name);
@@ -303,7 +300,7 @@ void cloneUser(void) {
     char srcPath[PATH_MAX], destPath[PATH_MAX]; snprintf(srcPath, sizeof(srcPath), "%s/%s", ACCOUNTS_DIR, src); snprintf(destPath, sizeof(destPath), "%s/%s", ACCOUNTS_DIR, dest);
     DIR *d = opendir(srcPath); if (!d) { printf("Source user does not exist.\n"); return; } closedir(d);
     d = opendir(destPath); if (d) { closedir(d); printf("Destination user already exists.\n"); return; }
-    /* perform a recursive copy in-process (no shell/system) */
+    
     if (copy_recursive(srcPath, destPath) != 0) { printf("Error: Failed to clone user data\n"); return; }
     printf("User '%s' cloned to '%s'.\n", src, dest);
 }
@@ -339,9 +336,7 @@ void rebuildBase(void) {
     printf("Base image rebuilt.\n");
 }
 
-/* changeimg - prompt for a URL and download a new base qcow2 into BASE_DIR/base.qcow2
-   Simple safety checks: only accepts http(s) URLs and rejects single-quote characters
- */
+ 
 void changeimg(void) {
     char url[2048];
     printf("Enter image URL (http(s)://...): ");
@@ -354,10 +349,10 @@ void changeimg(void) {
     }
     if (strchr(url, '\'') != NULL) { printf("URL contains invalid character '\''\n"); return; }
 
-    /* ensure base dir exists */
+    
     if (mkdir(BASE_DIR, 0755) != 0 && errno != EEXIST) { perror("mkdir base"); return; }
 
-        /* create a temp file and download into it */
+        
         char tmp_template[PATH_MAX];
         if (snprintf(tmp_template, sizeof(tmp_template), "%s/baseimg.XXXXXX", BASE_DIR) >= (int)sizeof(tmp_template)) { printf("path too long\n"); return; }
         int fd = mkstemp(tmp_template);
@@ -367,14 +362,13 @@ void changeimg(void) {
         pid_t pid = fork();
         if (pid < 0) { perror("fork"); unlink(tmp_template); return; }
         if (pid == 0) {
-            /* child: try curl then wget */
             execlp("curl", "curl", "-L", "--fail", "-o", tmp_template, url, (char *)NULL);
-            /* if curl failed, try wget */
+            
             execlp("wget", "wget", "-O", tmp_template, url, (char *)NULL);
-            /* both exec failed */
+            
             perror("exec(curl/wget)"); _exit(127);
         }
-        /* parent: wait for download to finish */
+        
         int status = 0;
         if (waitpid(pid, &status, 0) < 0) { perror("waitpid"); unlink(tmp_template); return; }
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) { fprintf(stderr, "Download failed (code=%d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1); unlink(tmp_template); return; }
@@ -382,21 +376,20 @@ void changeimg(void) {
         struct stat st;
         if (stat(tmp_template, &st) != 0 || st.st_size == 0) { fprintf(stderr, "Downloaded file missing/empty\n"); unlink(tmp_template); return; }
 
-/* replace the canonical base image */
+ 
 if (access(VM_BASE_QCOW2, F_OK) == 0) {
     if (unlink(VM_BASE_QCOW2) != 0) perror("unlink old base");
 }
 if (rename(tmp_template, VM_BASE_QCOW2) != 0) {
     perror("rename base");
-    unlink(tmp_template);  // nur löschen, wenn rename fehlschlägt
+    unlink(tmp_template);
     return;
 }
 printf("Base image updated to %s\n", VM_BASE_QCOW2);
 
-/* --- end of changeimg() --- */
-}  // <-- diese schließende Klammer fehlte
+}
 
-/* --- VM operations --- */
+ 
 
 void startVM(void) {
     if (access("/usr/bin/qemu-system-x86_64", X_OK) != 0) {
@@ -416,14 +409,12 @@ void startVM(void) {
     int port = findFreePort();
     if (port <= 0) { printf("Keine freien Ports verfügbar\n"); return; }
 
-    /* prepare logging and pid files inside account directory */
+    
     char accountDir[PATH_MAX * 2]; if (snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName) >= (int)sizeof(accountDir)) { printf("Internal path too long\n"); return; }
     char userLog[PATH_MAX * 2]; if (snprintf(userLog, sizeof(userLog), "%s/vm.log", accountDir) >= (int)sizeof(userLog)) { printf("Internal path too long\n"); return; }
     char userPid[PATH_MAX * 2]; if (snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir) >= (int)sizeof(userPid)) { printf("Internal path too long\n"); return; }
 
-    /* create a pipe so the child can notify parent if exec fails
-       (we set FD_CLOEXEC on the write end in the child so a successful
-       exec will close it; parent seeing EOF means exec succeeded) */
+    
     int pw[2];
     if (pipe(pw) != 0) { perror("pipe"); return; }
 
@@ -431,51 +422,46 @@ void startVM(void) {
     if (pid < 0) { perror("fork"); close(pw[0]); close(pw[1]); return; }
 
     if (pid == 0) {
-        /* child */
-        close(pw[0]); /* close read end in child */
-        /* ensure the write end is closed on successful exec */
+        close(pw[0]);
         int flags = fcntl(pw[1], F_GETFD);
         if (flags != -1) fcntl(pw[1], F_SETFD, flags | FD_CLOEXEC);
 
-        int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644);
-        if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
+          int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644);
+          if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
+          
+          int nullfd = open("/dev/null", O_RDONLY);
+          if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
         char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp::%d-:22", port);
         char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
         char *const argv[] = { "qemu-system-x86_64", "-m", "512M", "-nographic", "-net", portarg, "-net", "nic", "-drive", drivearg, NULL };
         execvp("qemu-system-x86_64", argv);
 
-        /* exec failed: write errno to pipe so parent knows, then exit */
+        
         int save_errno = errno;
         (void)write(pw[1], &save_errno, sizeof(save_errno));
         close(pw[1]);
         _exit(127);
     }
 
-    /* parent */
-    close(pw[1]); /* close write end in parent */
-    /* read from pipe: 0 bytes => exec succeeded (child's write fd closed on exec)
-       >0 bytes => exec failed and child wrote errno */
+    close(pw[1]);
     int child_errno = 0;
     ssize_t r = read(pw[0], &child_errno, sizeof(child_errno));
     close(pw[0]);
 
     if (r == 0) {
-        /* exec succeeded; child is now qemu. Write pidfile and print info. */
         FILE *f = fopen(userPid, "w"); if (f) { fprintf(f, "%d\n", pid); fclose(f); }
         int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
         printf("VM started: port=%d pid=%d disk=%s log=%s pidfile=%s\n", port, pid, diskPath, userLog, userPid);
     } else if (r > 0) {
-        /* child failed to exec; reap and report the errno it sent */
         int status = 0; waitpid(pid, &status, 0);
         fprintf(stderr, "Failed to start qemu: exec failed (errno=%d)\n", child_errno);
         return;
     } else {
-        /* read error */
         int saved = errno; fprintf(stderr, "Failed to start qemu: pipe read error: %s\n", strerror(saved));
         waitpid(pid, NULL, 0);
         return;
     }
-    /* make sure log exists */
+    
     int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
     printf("VM started: port=%d pid=%d disk=%s log=%s pidfile=%s\n", port, pid, diskPath, userLog, userPid);
 }
@@ -488,12 +474,12 @@ void stopVM(void) {
     if (!f) { printf("No pidfile found for '%s'. Is VM running?\n", accountName); return; }
     int pid = 0; if (fscanf(f, "%d", &pid) != 1) { fclose(f); printf("Failed to read pidfile\n"); return; } fclose(f);
     if (kill((pid_t)pid, SIGTERM) != 0) { perror("kill"); return; }
-    /* remove pidfile after stopping */
+    
     if (unlink(userPid) != 0) perror("unlink pidfile");
     printf("Sent SIGTERM to pid %d for account '%s'\n", pid, accountName);
 }
 
-/* showHelp alphabetical */
+ 
 void showHelp(void) {
     printf("\nAvailable commands:\n");
     printf("checkuser     - Check if an account exists\n");
@@ -538,13 +524,13 @@ void menu(void) {
 }
 
 int main(void) {
-    /* automation API removed; starting main CLI only */
+    
     if (ensureAccountsFolder() != 0) {
         fprintf(stderr, "Failed to create accounts directory\n");
         return 1;
     }
     if (ensureBaseImage() != 0) fprintf(stderr, "Warning: base image not available\n");
     menu();
-    /* exiting */
+    
     return 0;
 }
