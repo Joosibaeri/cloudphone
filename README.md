@@ -1,1 +1,17 @@
-This project contains the server component of CloudPhone. The server is written in C and runs on Linux, handling all processing and user account management while communicating with a small ARM client via SSH. User accounts are stored under /userdata/accounts, and the server automatically creates required directories on first launch. The main program is located in main.c, and setup scripts can be found in setup.sh. Virtual machine-related files are stored in the vm/ folder, which includes base root filesystems for testing. The server is built to be lightweight and modular, allowing ARM devices such as Raspberry Pi models to send requests while the server processes them and returns responses. Compilation requires GCC with C support, and the server can be started directly after building. CloudPhone is designed for controlled environments, keeping the client minimal while the server handles all logic and data management.
+This project contains the server component of CloudPhone. The server is written in C and runs on Linux, handling all processing and user account management while communicating with a small ARM client via SSH.
+
+User accounts are stored under `/userdata/accounts`, and the server automatically creates required directories on first launch. The main source file is `main.c`. Virtual machine-related files are stored in the `vm/` folder and include base root filesystems useful for testing.
+
+Build & run
+--------------
+
+The preferred way to build the server is via the provided Makefile which produces an executable named `main`:
+
+```sh
+make         # builds `main` from main.c
+./main       # run the server
+```
+
+If you want the compatibility name used previously, `make cloudphone_server` will produce an executable named `cloudphone_server`.
+
+CloudPhone is designed for controlled environments, keeping the client minimal while the server handles most of the logic and data management.
