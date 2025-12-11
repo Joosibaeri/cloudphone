@@ -9,24 +9,21 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <limits.h>
-#include <linux/limits.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <ifaddrs.h>
 #include <netdb.h>
 
  
 
-#define ACCOUNTS_DIR "/userdata/accounts"
-#define BASE_DIR        "/userdata/base"
-#define VM_BASE_QCOW2   "/userdata/base/base.qcow2"
+#define ACCOUNTS_DIR "./vm/userdata/accounts"
+#define BASE_DIR        "./vm/userdata/base"
+#define VM_BASE_QCOW2   "./vm/userdata/base/base.qcow2"
 
  
 int selectAccount(char *accountName);
-int create_qr_for_user(const char *accountPath, const char *name);
 int ensureBaseImage(void);
 int ensureAccountsFolder(void);
 void listAccounts(void);
@@ -46,7 +43,25 @@ int findFreePort(void);
 void showHelp(void);
 void menu(void);
 
- 
+static int ensure_dir(const char *path) {
+    if (!path || !*path) { errno = EINVAL; return -1; }
+    char tmp[PATH_MAX];
+    size_t len = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (len == 0 || len >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
+    while (len > 1 && tmp[len-1] == '/') { tmp[len-1] = '\0'; --len; }
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(tmp, 0755) != 0) {
+            if (errno != EEXIST) return -1;
+        }
+        *p = '/';
+    }
+    if (mkdir(tmp, 0755) != 0) {
+        if (errno != EEXIST) return -1;
+    }
+    return 0;
+}
 
 int selectAccount(char *accountName) {
     listAccounts();
@@ -59,20 +74,14 @@ int selectAccount(char *accountName) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", ACCOUNTS_DIR, accountName);
     DIR *dir = opendir(path);
-    if (!dir) { printf("Error: Account '%s' does not exist!\n", accountName); return 0; }
+    if (!dir) { printf("Error: account '%s' does not exist\n", accountName); return 0; }
     closedir(dir);
     return 1;
 }
 
  
 int ensureBaseImage(void) {
-    DIR *d = opendir(BASE_DIR);
-    if (!d) {
-        if (mkdir(BASE_DIR, 0755) != 0 && errno != EEXIST) {
-            perror("mkdir base");
-            return -1;
-        }
-    } else closedir(d);
+    if (ensure_dir(BASE_DIR) != 0) { perror("mkdir base"); return -1; }
 
     if (access(VM_BASE_QCOW2, F_OK) != 0) {
         char tmp[PATH_MAX];
@@ -91,8 +100,7 @@ int ensureBaseImage(void) {
 void listAccounts(void) {
     struct dirent *entry;
     DIR *dp = opendir(ACCOUNTS_DIR);
-    if (!dp) { printf("No accounts found.\n"); return; }
-
+    if (!dp) { printf("No accounts found\n"); return; }
     printf("Available accounts:\n");
     int idx = 1;
     while ((entry = readdir(dp))) {
@@ -107,9 +115,7 @@ void listAccounts(void) {
 
  
 int ensureAccountsFolder(void) {
-    DIR *d = opendir(ACCOUNTS_DIR);
-    if (d) { closedir(d); return 0; }
-    if (mkdir(ACCOUNTS_DIR, 0755) != 0 && errno != EEXIST) { perror("mkdir accounts"); return -1; }
+    if (ensure_dir(ACCOUNTS_DIR) != 0) { perror("mkdir accounts"); return -1; }
     return 0;
 }
 
@@ -227,139 +233,6 @@ int findFreePort(void) {
     return -1;
 }
 
-/* Try to determine a sensible server IP address (first non-loopback IPv4) */
-static int get_server_ip(char *buf, size_t size) {
-    struct ifaddrs *ifaddr, *ifa;
-    if (getifaddrs(&ifaddr) == -1) return -1;
-    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr) continue;
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            char host[INET_ADDRSTRLEN];
-            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-            if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == NULL) continue;
-            if (strncmp(host, "127.", 4) == 0) continue; /* skip loopback */
-            strncpy(buf, host, size - 1);
-            buf[size-1] = '\0';
-            freeifaddrs(ifaddr);
-            return 0;
-        }
-    }
-    freeifaddrs(ifaddr);
-    /* fallback to localhost */
-    strncpy(buf, "127.0.0.1", size - 1);
-    buf[size-1] = '\0';
-    return 0;
-}
-
-static int port_from_name(const char *name) {
-    int port = 2200;
-    for (int i = 0; name[i]; i++) port += (unsigned char)name[i];
-    return port;
-}
-
-/* Create an encrypted payload containing server ip and port and attempt to turn it into a QR image
- * The function prefers to use `openssl` and `qrencode` if available. When those are not present it
- * will fall back to writing a plaintext file containing the payload.
- */
-int create_qr_for_user(const char *accountPath, const char *name) {
-    if (!accountPath || !name) return -1;
-
-    char serverip[64];
-    if (get_server_ip(serverip, sizeof(serverip)) != 0) strncpy(serverip, "127.0.0.1", sizeof(serverip));
-    int port = port_from_name(name);
-
-    char payload[512];
-    if (snprintf(payload, sizeof(payload), "{\"server\":\"%s\",\"port\":%d}", serverip, port) >= (int)sizeof(payload)) return -1;
-
-    /* make user file paths */
-    char out_png[PATH_MAX * 2];
-    if (snprintf(out_png, sizeof(out_png), "%s/access.png", accountPath) >= (int)sizeof(out_png)) return -1;
-    char out_txt[PATH_MAX * 2];
-    if (snprintf(out_txt, sizeof(out_txt), "%s/access.txt", accountPath) >= (int)sizeof(out_txt)) return -1;
-
-    /* Create temporary payload file */
-    char tmp_payload_template[PATH_MAX];
-    if (snprintf(tmp_payload_template, sizeof(tmp_payload_template), "%s/payload.XXXXXX", accountPath) >= (int)sizeof(tmp_payload_template)) return -1;
-    int fd_payload = mkstemp(tmp_payload_template);
-    if (fd_payload < 0) return -1;
-    ssize_t w = write(fd_payload, payload, strlen(payload));
-    (void)w; /* silence unused warning */
-    close(fd_payload);
-
-    /* Get secret from env */
-    const char *secret = getenv("CLOUDPHONE_QR_SECRET");
-    if (!secret) secret = "cloudphone";
-
-    /* Basic sanitization: avoid single quote because we'll pass the secret on the command line using quotes */
-    int secret_ok = 1;
-    for (const char *p = secret; *p; ++p) if (*p == '\'') { secret_ok = 0; break; }
-
-    int have_openssl = (system("command -v openssl >/dev/null 2>&1") == 0);
-    int have_qrencode = (system("command -v qrencode >/dev/null 2>&1") == 0);
-
-    char tmp_encrypted[PATH_MAX];
-    int encrypted_ok = 0;
-
-    if (have_openssl && secret_ok) {
-        if (snprintf(tmp_encrypted, sizeof(tmp_encrypted), "%s/encrypted.XXXXXX", accountPath) >= (int)sizeof(tmp_encrypted)) {
-            unlink(tmp_payload_template); return -1; }
-        int fd_enc = mkstemp(tmp_encrypted);
-        if (fd_enc >= 0) close(fd_enc);
-
-        char cmd[PATH_MAX * 3];
-        /* encrypt payload file to base64 using openssl */
-        if (snprintf(cmd, sizeof(cmd), "openssl enc -aes-256-cbc -a -salt -pass pass:'%s' -in '%s' -out '%s' 2>/dev/null", secret, tmp_payload_template, tmp_encrypted) < 0) {
-            unlink(tmp_payload_template); unlink(tmp_encrypted); return -1; }
-
-        if (system(cmd) == 0) encrypted_ok = 1; else { unlink(tmp_encrypted); encrypted_ok = 0; }
-    }
-
-    /* If encryption succeeded and qrencode is available, create png from encrypted base64 file */
-    if (encrypted_ok && have_qrencode) {
-        char cmd[PATH_MAX * 3];
-        /* feed encrypted base64 into qrencode via stdin */
-        if (snprintf(cmd, sizeof(cmd), "qrencode -o '%s' -t PNG -s 8 - < '%s' >/dev/null 2>&1", out_png, tmp_encrypted) < 0) { unlink(tmp_payload_template); unlink(tmp_encrypted); return -1; }
-        if (system(cmd) == 0) {
-            unlink(tmp_payload_template);
-            unlink(tmp_encrypted);
-            return 0;
-        }
-        /* qrencode failed for some reason - remove tmp_encrypted but fall back */
-        unlink(tmp_encrypted);
-    }
-
-    /* If encrypted file exists but qrencode missing, write encrypted as text file */
-    if (encrypted_ok && !have_qrencode) {
-        /* rename encrypted file to accountPath/access.enc.txt */
-        char out_enc[PATH_MAX * 2];
-        if (snprintf(out_enc, sizeof(out_enc), "%s/access.enc.txt", accountPath) < (int)sizeof(out_enc)) {
-            if (rename(tmp_encrypted, out_enc) == 0) {
-                unlink(tmp_payload_template);
-                return 0;
-            }
-        }
-        unlink(tmp_encrypted);
-    }
-
-    /* fallback: write plaintext payload and try to create a QR from it if qrencode available */
-    int fd_txt = open(out_txt, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd_txt >= 0) {
-        write(fd_txt, payload, strlen(payload));
-        close(fd_txt);
-    }
-
-    if (have_qrencode) {
-        char cmd[PATH_MAX * 3];
-        if (snprintf(cmd, sizeof(cmd), "qrencode -o '%s' -t PNG -s 8 '%s' >/dev/null 2>&1", out_png, payload) >= 0) {
-            /* try creating PNG directly with plaintext payload */
-            if (system(cmd) == 0) { unlink(tmp_payload_template); return 0; }
-        }
-    }
-
-    unlink(tmp_payload_template);
-    return 0; /* although we may have only created plaintext access.txt, no hard failure */
-}
-
 void createUser(void) {
     if (ensureAccountsFolder() != 0) { printf("accounts folder missing and cannot be created\n"); return; }
     char name[128];
@@ -378,14 +251,18 @@ void createUser(void) {
         if (copyFile(VM_BASE_QCOW2, diskPath) != 0) fprintf(stderr, "Warning: failed to copy base to %s\n", diskPath);
     }
     printf("Account '%s' created at %s\n", name, accountPath);
-
-    /* Attempt to create an encrypted QR containing server IP and port */
-    if (create_qr_for_user(accountPath, name) != 0) {
-        fprintf(stderr, "Warning: failed to create encrypted QR for user '%s'\n", name);
+    {
+        char access_txt[PATH_MAX * 2];
+        if (snprintf(access_txt, sizeof(access_txt), "%s/access.txt", accountPath) < (int)sizeof(access_txt)) {
+            int fd = open(access_txt, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) {
+                const char *msg = "Access information removed - QR generation disabled\n";
+                write(fd, msg, strlen(msg));
+                close(fd);
+            }
+        }
     }
 }
-
-    
 
 void removeUser(void) {
     char name[50];
@@ -491,7 +368,7 @@ void changeimg(void) {
     if (strchr(url, '\'') != NULL) { printf("URL contains invalid character '\''\n"); return; }
 
     
-    if (mkdir(BASE_DIR, 0755) != 0 && errno != EEXIST) { perror("mkdir base"); return; }
+    if (ensure_dir(BASE_DIR) != 0) { perror("mkdir base"); return; }
 
         
         char tmp_template[PATH_MAX];
@@ -548,7 +425,7 @@ void startVM(void) {
     }
 
     int port = findFreePort();
-    if (port <= 0) { printf("Keine freien Ports verfügbar\n"); return; }
+    if (port <= 0) { printf("No free ports available\n"); return; }
 
     
     char accountDir[PATH_MAX * 2]; if (snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName) >= (int)sizeof(accountDir)) { printf("Internal path too long\n"); return; }
@@ -602,7 +479,6 @@ void startVM(void) {
         waitpid(pid, NULL, 0);
         return;
     }
-    
     int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
     printf("VM started: port=%d pid=%d disk=%s log=%s pidfile=%s\n", port, pid, diskPath, userLog, userPid);
 }
@@ -612,10 +488,9 @@ void stopVM(void) {
     if (!selectAccount(accountName)) return;
     char userPid[PATH_MAX]; snprintf(userPid, sizeof(userPid), "%s/%s/vm.pid", ACCOUNTS_DIR, accountName);
     FILE *f = fopen(userPid, "r");
-    if (!f) { printf("No pidfile found for '%s'. Is VM running?\n", accountName); return; }
+    if (!f) { printf("No pidfile found for '%s'. Is the VM running?\n", accountName); return; }
     int pid = 0; if (fscanf(f, "%d", &pid) != 1) { fclose(f); printf("Failed to read pidfile\n"); return; } fclose(f);
     if (kill((pid_t)pid, SIGTERM) != 0) { perror("kill"); return; }
-    
     if (unlink(userPid) != 0) perror("unlink pidfile");
     printf("Sent SIGTERM to pid %d for account '%s'\n", pid, accountName);
 }
