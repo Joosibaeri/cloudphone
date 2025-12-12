@@ -15,12 +15,13 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <netdb.h>
+#include <ifaddrs.h>
 
  
 
 #define ACCOUNTS_DIR "./vm/userdata/accounts"
-#define BASE_DIR        "./vm/userdata/base"
-#define VM_BASE_QCOW2   "./vm/userdata/base/base.qcow2"
+#define BASE_DIR "./vm"
+#define VM_BASE_QCOW2 "./vm/base.qcow2"
 
  
 int selectAccount(char *accountName);
@@ -43,6 +44,23 @@ int findFreePort(void);
 void showHelp(void);
 void menu(void);
 
+/* ask confirmation, default YES on empty input */
+static int ask_yes_default_yes(const char *prompt) {
+    char buf[32];
+    printf("%s", prompt);
+    if (!fgets(buf, sizeof(buf), stdin)) return 0;
+    buf[strcspn(buf, "\n")] = '\0';
+    if (buf[0] == '\0') return 1; /* default yes */
+    if (buf[0] == 'y' || buf[0] == 'Y') return 1;
+    return 0;
+}
+
+void showServerIP(void);
+
+/* pidfile helpers */
+static pid_t pidfile_read(const char *path);
+static int process_is_running(pid_t pid);
+
 static int ensure_dir(const char *path) {
     if (!path || !*path) { errno = EINVAL; return -1; }
     char tmp[PATH_MAX];
@@ -60,6 +78,23 @@ static int ensure_dir(const char *path) {
     if (mkdir(tmp, 0755) != 0) {
         if (errno != EEXIST) return -1;
     }
+    return 0;
+}
+
+static pid_t pidfile_read(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    long p = 0;
+    if (fscanf(f, "%ld", &p) != 1) p = 0;
+    fclose(f);
+    if (p <= 0) return 0;
+    return (pid_t)p;
+}
+
+static int process_is_running(pid_t pid) {
+    if (pid <= 0) return 0;
+    if (kill(pid, 0) == 0) return 1;
+    if (errno == EPERM) return 1;
     return 0;
 }
 
@@ -232,7 +267,6 @@ int findFreePort(void) {
     close(s);
     return -1;
 }
-
 void createUser(void) {
     if (ensureAccountsFolder() != 0) { printf("accounts folder missing and cannot be created\n"); return; }
     char name[128];
@@ -251,17 +285,6 @@ void createUser(void) {
         if (copyFile(VM_BASE_QCOW2, diskPath) != 0) fprintf(stderr, "Warning: failed to copy base to %s\n", diskPath);
     }
     printf("Account '%s' created at %s\n", name, accountPath);
-    {
-        char access_txt[PATH_MAX * 2];
-        if (snprintf(access_txt, sizeof(access_txt), "%s/access.txt", accountPath) < (int)sizeof(access_txt)) {
-            int fd = open(access_txt, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-            if (fd >= 0) {
-                const char *msg = "Access information removed - QR generation disabled\n";
-                write(fd, msg, strlen(msg));
-                close(fd);
-            }
-        }
-    }
 }
 
 void removeUser(void) {
@@ -278,9 +301,17 @@ void removeUser(void) {
     if (!d) { printf("Error: Account '%s' does not exist!\n", name); return; }
     closedir(d);
 
-    char confirm[8]; printf("Are you sure you want to delete '%s'? (y/n): ", name);
-    fgets(confirm, sizeof(confirm), stdin); confirm[strcspn(confirm, "\n")] = 0;
-    if (strcmp(confirm, "y") != 0 && strcmp(confirm, "Y") != 0) { printf("Aborted.\n"); return; }
+    /* refuse to delete while VM is running */
+    char userPid[PATH_MAX]; snprintf(userPid, sizeof(userPid), "%s/%s/vm.pid", ACCOUNTS_DIR, name);
+    pid_t existing = pidfile_read(userPid);
+    if (existing && process_is_running(existing)) {
+        printf("Error: VM for '%s' appears to be running (pid=%d). Stop it before deleting.\n", name, (int)existing);
+        return;
+    }
+
+    char prompt[256];
+    snprintf(prompt, sizeof(prompt), "Are you sure you want to delete '%s'? [Y/n]: ", name);
+    if (!ask_yes_default_yes(prompt)) { printf("Aborted.\n"); return; }
 
     if (remove_recursive(accountPath) != 0) { printf("Error: Failed to delete account '%s'\n", name); return; }
     printf("Account '%s' deleted.\n", name);
@@ -407,17 +438,51 @@ printf("Base image updated to %s\n", VM_BASE_QCOW2);
 
 }
 
+void showServerIP(void) {
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1) {
+        printf("Server IP: 127.0.0.1 (fallback)\n");
+        return;
+    }
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            char host[INET_ADDRSTRLEN];
+            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+            if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == NULL) continue;
+            if (strncmp(host, "127.", 4) == 0) continue;
+            printf("Server IP: %s\n", host);
+            freeifaddrs(ifaddr);
+            return;
+        }
+    }
+    freeifaddrs(ifaddr);
+    printf("Server IP: 127.0.0.1 (fallback)\n");
+}
  
 
 void startVM(void) {
     if (access("/usr/bin/qemu-system-x86_64", X_OK) != 0) {
-    fprintf(stderr, "QEMU ist nicht installiert oder nicht im PATH\n");
-    return;
-}
+        fprintf(stderr, "QEMU is not installed or not in PATH\n");
+        return;
+    }
 
     if (ensureBaseImage() != 0) { printf("Base image missing and cannot be prepared\n"); return; }
     char accountName[128]; if (!selectAccount(accountName)) return;
     char diskPath[PATH_MAX]; snprintf(diskPath, sizeof(diskPath), "%s/%s/disk.qcow2", ACCOUNTS_DIR, accountName);
+
+    /* check for existing running VM for this account */
+    char pidpath[PATH_MAX]; snprintf(pidpath, sizeof(pidpath), "%s/%s/vm.pid", ACCOUNTS_DIR, accountName);
+    pid_t existing = pidfile_read(pidpath);
+    if (existing) {
+        if (process_is_running(existing)) {
+            printf("Error: VM for '%s' already running (pid=%d).\n", accountName, (int)existing);
+            return;
+        } else {
+            /* remove stale pidfile */
+            unlink(pidpath);
+        }
+    }
 
     if (access(diskPath, F_OK) != 0) {
         printf("Account '%s' disk.qcow2 not found. Copying base image...\n", accountName);
@@ -480,19 +545,22 @@ void startVM(void) {
         return;
     }
     int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
-    printf("VM started: port=%d pid=%d disk=%s log=%s pidfile=%s\n", port, pid, diskPath, userLog, userPid);
 }
 
 void stopVM(void) {
     char accountName[128];
     if (!selectAccount(accountName)) return;
     char userPid[PATH_MAX]; snprintf(userPid, sizeof(userPid), "%s/%s/vm.pid", ACCOUNTS_DIR, accountName);
-    FILE *f = fopen(userPid, "r");
-    if (!f) { printf("No pidfile found for '%s'. Is the VM running?\n", accountName); return; }
-    int pid = 0; if (fscanf(f, "%d", &pid) != 1) { fclose(f); printf("Failed to read pidfile\n"); return; } fclose(f);
+    pid_t pid = pidfile_read(userPid);
+    if (!pid) { printf("No pidfile found for '%s'. Is the VM running?\n", accountName); return; }
+    if (!process_is_running(pid)) {
+        printf("Stale pidfile found (pid=%d). Removing pidfile.\n", (int)pid);
+        if (unlink(userPid) != 0) perror("unlink pidfile");
+        return;
+    }
     if (kill((pid_t)pid, SIGTERM) != 0) { perror("kill"); return; }
     if (unlink(userPid) != 0) perror("unlink pidfile");
-    printf("Sent SIGTERM to pid %d for account '%s'\n", pid, accountName);
+    printf("Sent SIGTERM to pid %d for account '%s'\n", (int)pid, accountName);
 }
 
  
@@ -509,7 +577,8 @@ void showHelp(void) {
     printf("resetuser     - Reset a user's disk.qcow2 from base\n");
     printf("startvm       - Start a VM\n");
     printf("stopvm        - Stop all VMs\n");
-    printf("changeimg     - Download a new base QCOW2 from a URL (replace /userdata/base/base.qcow2)\n");
+    printf("serverip      - Show server IP address\n");
+    printf("changeimg     - Download a new base QCOW2 from a URL (replace ./vm/base.qcow2)\n");
     printf("userinfo      - Show info about a user\n\n");
 }
 
@@ -533,7 +602,11 @@ void menu(void) {
         else if (!strcmp(input, "rebuildbase")) rebuildBase();
         else if (!strcmp(input, "help")) showHelp();
         else if (!strcmp(input, "changeimg")) changeimg();
-        else if (!strcmp(input, "exit")) exit(0);
+        else if (!strcmp(input, "serverip")) showServerIP();
+        else if (!strcmp(input, "exit")) {
+            if (ask_yes_default_yes("Are you sure you want to exit? [Y/n]: ")) exit(0);
+            continue;
+        }
         else if (strlen(input) == 0) continue;
         else printf("Error: Unknown command '%s'. Type 'help' for available commands.\n", input);
     }
