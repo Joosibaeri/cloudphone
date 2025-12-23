@@ -3,7 +3,7 @@ set -e
 
 BASE_DIR="/userdata/base"
 IMG_FILE="$BASE_DIR/base.qcow2"
-DEFAULT_URL="https://ftp.fau.de/archlinux/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+DEFAULT_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
 
 usage() {
     cat <<EOF

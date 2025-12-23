@@ -17,15 +17,20 @@
 #include <netdb.h>
 #include <ifaddrs.h>
 
- 
-
 #define ACCOUNTS_DIR "./vm/userdata/accounts"
 #define BASE_DIR "./vm"
 #define VM_BASE_QCOW2 "./vm/base.qcow2"
+#define VM_LAUNCH_BIN "./vm/launch"
+#define VM_PROVISIONER "./vm/provision_base.sh"
+#define BASE_PROVISION_STAMP "./vm/base.provisioned"
+#define CAMERA_OUT_NAME "camera.mjpg"
+#define CAMERA_LOG_NAME "cam.log"
+#define CAMERA_PID_NAME "cam.pid"
+#define CAMERA_PORT_FILE "camera.port"
 
- 
 int selectAccount(char *accountName);
 int ensureBaseImage(void);
+int ensureBaseProvisioned(void);
 int ensureAccountsFolder(void);
 void listAccounts(void);
 void createUser(void);
@@ -38,6 +43,10 @@ void rebuildBase(void);
 void startVM(void);
 void stopVM(void);
  
+int deployLaunchBinary(const char *accountDir);
+pid_t startCameraBridge(const char *accountDir, int *outPort);
+void stopCameraBridge(const char *accountDir);
+
 void changeimg(void);
 int findFreePort(void);
  
@@ -120,13 +129,43 @@ int ensureBaseImage(void) {
 
     if (access(VM_BASE_QCOW2, F_OK) != 0) {
         char tmp[PATH_MAX];
-        snprintf(tmp, sizeof(tmp), "%s/arch-cloudimg.qcow2", BASE_DIR);
+        snprintf(tmp, sizeof(tmp), "%s/debian-cloudimg.qcow2", BASE_DIR);
         fprintf(stderr, "Base qcow2 not found at %s. Attempting download...\n", VM_BASE_QCOW2);
         char cmd[PATH_MAX * 2];
-        int r = snprintf(cmd, sizeof(cmd), "wget -O '%s' https://ftp.fau.de/archlinux/images/latest/Arch-Linux-x86_64-cloudimg.qcow2", tmp);
+        int r = snprintf(cmd, sizeof(cmd), "wget -O '%s' https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2", tmp);
         if (r < 0 || r >= (int)sizeof(cmd)) { fprintf(stderr, "URL too long for command buffer\n"); return -1; }
         if (system(cmd) != 0) { fprintf(stderr, "Failed to download base image\n"); return -1; }
         if (rename(tmp, VM_BASE_QCOW2) != 0) perror("rename base image");
+    }
+    return ensureBaseProvisioned();
+}
+
+int ensureBaseProvisioned(void) {
+    struct stat st;
+    if (stat(BASE_PROVISION_STAMP, &st) == 0) return 0;
+
+    if (access(VM_PROVISIONER, X_OK) != 0) {
+        fprintf(stderr, "Provisioner script missing or not executable: %s\n", VM_PROVISIONER);
+        return -1;
+    }
+
+    char cmd[PATH_MAX * 2];
+    int r = snprintf(cmd, sizeof(cmd), "%s '%s'", VM_PROVISIONER, VM_BASE_QCOW2);
+    if (r < 0 || r >= (int)sizeof(cmd)) {
+        fprintf(stderr, "Provision command too long\n");
+        return -1;
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "Provisioner failed with code %d\n", rc);
+        return -1;
+    }
+
+    int fd = open(BASE_PROVISION_STAMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const char *msg = "provisioned\n";
+        (void)write(fd, msg, strlen(msg));
+        close(fd);
     }
     return 0;
 }
@@ -248,6 +287,116 @@ static int copy_recursive(const char *src, const char *dst) {
     return (r == 0) ? 0 : -1;
 }
 
+static int write_int_file(const char *path, int value) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d\n", value);
+    ssize_t w = write(fd, buf, (size_t)len);
+    close(fd);
+    return (w == len) ? 0 : -1;
+}
+
+int deployLaunchBinary(const char *accountDir) {
+    char dst[PATH_MAX];
+    if (snprintf(dst, sizeof(dst), "%s/launch", accountDir) >= (int)sizeof(dst)) return -1;
+    if (access(VM_LAUNCH_BIN, X_OK) != 0) {
+        fprintf(stderr, "launch helper missing at %s\n", VM_LAUNCH_BIN);
+        return -1;
+    }
+    if (copyFile(VM_LAUNCH_BIN, dst) != 0) {
+        perror("copy launch helper");
+        return -1;
+    }
+    chmod(dst, 0755);
+    return 0;
+}
+
+pid_t startCameraBridge(const char *accountDir, int *outPort) {
+    char bin[PATH_MAX], out[PATH_MAX], logp[PATH_MAX], pidp[PATH_MAX], portfile[PATH_MAX];
+    if (snprintf(bin, sizeof(bin), "%s/launch", accountDir) >= (int)sizeof(bin)) return -1;
+    if (snprintf(out, sizeof(out), "%s/%s", accountDir, CAMERA_OUT_NAME) >= (int)sizeof(out)) return -1;
+    if (snprintf(logp, sizeof(logp), "%s/%s", accountDir, CAMERA_LOG_NAME) >= (int)sizeof(logp)) return -1;
+    if (snprintf(pidp, sizeof(pidp), "%s/%s", accountDir, CAMERA_PID_NAME) >= (int)sizeof(pidp)) return -1;
+    if (snprintf(portfile, sizeof(portfile), "%s/%s", accountDir, CAMERA_PORT_FILE) >= (int)sizeof(portfile)) return -1;
+
+    pid_t existing = pidfile_read(pidp);
+    if (existing && process_is_running(existing)) {
+        fprintf(stderr, "Camera bridge already running (pid=%d).\n", (int)existing);
+        if (outPort) *outPort = -1;
+        return existing;
+    }
+    unlink(pidp);
+
+    if (deployLaunchBinary(accountDir) != 0) {
+        fprintf(stderr, "Failed to deploy launch helper into %s\n", accountDir);
+        return -1;
+    }
+
+    int port = findFreePort();
+    if (port <= 0) {
+        fprintf(stderr, "No free port for camera bridge\n");
+        return -1;
+    }
+    if (write_int_file(portfile, port) != 0) {
+        fprintf(stderr, "Warning: failed to write camera port file\n");
+    }
+    if (outPort) *outPort = port;
+
+    int pw[2];
+    if (pipe(pw) != 0) { perror("pipe"); return -1; }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); close(pw[0]); close(pw[1]); return -1; }
+
+    if (pid == 0) {
+        close(pw[0]);
+        int flags = fcntl(pw[1], F_GETFD);
+        if (flags != -1) fcntl(pw[1], F_SETFD, flags | FD_CLOEXEC);
+
+        int fd = open(logp, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
+
+        char portStr[32]; snprintf(portStr, sizeof(portStr), "%d", port);
+        char *const argv[] = { bin, "--camera-port", portStr, "--out", out, "--log", logp, "--pid-file", pidp, NULL };
+        execv(bin, argv);
+
+        int save_errno = errno;
+        (void)write(pw[1], &save_errno, sizeof(save_errno));
+        close(pw[1]);
+        _exit(127);
+    }
+
+    close(pw[1]);
+    int child_errno = 0;
+    ssize_t r = read(pw[0], &child_errno, sizeof(child_errno));
+    close(pw[0]);
+
+    if (r == 0) {
+        return pid;
+    }
+    if (r > 0) {
+        int status = 0; waitpid(pid, &status, 0);
+        fprintf(stderr, "Failed to start camera bridge: errno=%d\n", child_errno);
+    } else {
+        int saved = errno; fprintf(stderr, "Failed to start camera bridge: pipe read error: %s\n", strerror(saved));
+        waitpid(pid, NULL, 0);
+    }
+    return -1;
+}
+
+void stopCameraBridge(const char *accountDir) {
+    char pidp[PATH_MAX], portfile[PATH_MAX];
+    if (snprintf(pidp, sizeof(pidp), "%s/%s", accountDir, CAMERA_PID_NAME) >= (int)sizeof(pidp)) return;
+    if (snprintf(portfile, sizeof(portfile), "%s/%s", accountDir, CAMERA_PORT_FILE) >= (int)sizeof(portfile)) return;
+    pid_t pid = pidfile_read(pidp);
+    if (pid && process_is_running(pid)) {
+        kill(pid, SIGTERM);
+    }
+    unlink(pidp);
+    unlink(portfile);
+}
+
  
 int findFreePort(void) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -283,6 +432,9 @@ void createUser(void) {
     char diskPath[PATH_MAX]; if (snprintf(diskPath, sizeof(diskPath), "%s/disk.qcow2", accountPath) >= (int)sizeof(diskPath)) return;
     if (access(VM_BASE_QCOW2, F_OK) == 0) {
         if (copyFile(VM_BASE_QCOW2, diskPath) != 0) fprintf(stderr, "Warning: failed to copy base to %s\n", diskPath);
+    }
+    if (deployLaunchBinary(accountPath) != 0) {
+        fprintf(stderr, "Warning: launch helper not deployed to %s\n", accountPath);
     }
     printf("Account '%s' created at %s\n", name, accountPath);
 }
@@ -351,6 +503,9 @@ void cloneUser(void) {
     d = opendir(destPath); if (d) { closedir(d); printf("Destination user already exists.\n"); return; }
     
     if (copy_recursive(srcPath, destPath) != 0) { printf("Error: Failed to clone user data\n"); return; }
+    if (deployLaunchBinary(destPath) != 0) {
+        fprintf(stderr, "Warning: launch helper not deployed to %s\n", destPath);
+    }
     printf("User '%s' cloned to '%s'.\n", src, dest);
 }
 
@@ -374,6 +529,9 @@ void resetUser(void) {
     }
     printf("Copying fresh base qcow2...\n");
     if (copyFile(VM_BASE_QCOW2, disk) != 0) { fprintf(stderr, "Failed to copy base -> %s\n", disk); return; }
+    if (deployLaunchBinary(accountPath) != 0) {
+        fprintf(stderr, "Warning: launch helper not deployed to %s\n", accountPath);
+    }
     printf("User '%s' was reset. (disk=%s)\n", name, disk);
 }
 
@@ -484,20 +642,28 @@ void startVM(void) {
         }
     }
 
+    char accountDir[PATH_MAX * 2]; if (snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName) >= (int)sizeof(accountDir)) { printf("Internal path too long\n"); return; }
+    char userLog[PATH_MAX * 2]; if (snprintf(userLog, sizeof(userLog), "%s/vm.log", accountDir) >= (int)sizeof(userLog)) { printf("Internal path too long\n"); return; }
+    char userPid[PATH_MAX * 2]; if (snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir) >= (int)sizeof(userPid)) { printf("Internal path too long\n"); return; }
+
     if (access(diskPath, F_OK) != 0) {
         printf("Account '%s' disk.qcow2 not found. Copying base image...\n", accountName);
         if (copyFile(VM_BASE_QCOW2, diskPath) != 0) { perror("copyFile"); return; }
     }
 
-    int port = findFreePort();
-    if (port <= 0) { printf("No free ports available\n"); return; }
+    if (deployLaunchBinary(accountDir) != 0) {
+        fprintf(stderr, "Warning: launch helper not deployed to %s\n", accountDir);
+    }
 
-    
-    char accountDir[PATH_MAX * 2]; if (snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName) >= (int)sizeof(accountDir)) { printf("Internal path too long\n"); return; }
-    char userLog[PATH_MAX * 2]; if (snprintf(userLog, sizeof(userLog), "%s/vm.log", accountDir) >= (int)sizeof(userLog)) { printf("Internal path too long\n"); return; }
-    char userPid[PATH_MAX * 2]; if (snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir) >= (int)sizeof(userPid)) { printf("Internal path too long\n"); return; }
+    int sshPort = findFreePort();
+    if (sshPort <= 0) { printf("No free ports available for SSH\n"); return; }
 
-    
+    int cameraPort = -1;
+    pid_t camPid = startCameraBridge(accountDir, &cameraPort);
+    if (camPid <= 0) {
+        fprintf(stderr, "Warning: camera bridge not started for '%s'\n", accountName);
+    }
+
     int pw[2];
     if (pipe(pw) != 0) { perror("pipe"); return; }
 
@@ -514,9 +680,19 @@ void startVM(void) {
           
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
-        char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp::%d-:22", port);
-        char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
-        char *const argv[] = { "qemu-system-x86_64", "-m", "512M", "-nographic", "-net", portarg, "-net", "nic", "-drive", drivearg, NULL };
+                char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp::%d-:22", sshPort);
+                char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
+                char virtfs[PATH_MAX + 96]; snprintf(virtfs, sizeof(virtfs), "local,id=hostshare,path=%s,security_model=none,mount_tag=hostshare", accountDir);
+                char *const argv[] = {
+                    "qemu-system-x86_64",
+                    "-m", "512M",
+                    "-nographic",
+                    "-net", portarg,
+                    "-net", "nic",
+                    "-drive", drivearg,
+                    "-virtfs", virtfs,
+                    NULL
+                };
         execvp("qemu-system-x86_64", argv);
 
         
@@ -534,7 +710,11 @@ void startVM(void) {
     if (r == 0) {
         FILE *f = fopen(userPid, "w"); if (f) { fprintf(f, "%d\n", pid); fclose(f); }
         int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
-        printf("VM started: port=%d pid=%d disk=%s log=%s pidfile=%s\n", port, pid, diskPath, userLog, userPid);
+        if (cameraPort > 0) {
+            printf("VM started: ssh=%d camera=%d pid=%d disk=%s log=%s pidfile=%s (cam pid may be %d)\n", sshPort, cameraPort, pid, diskPath, userLog, userPid, (int)camPid);
+        } else {
+            printf("VM started: ssh=%d pid=%d disk=%s log=%s pidfile=%s\n", sshPort, pid, diskPath, userLog, userPid);
+        }
     } else if (r > 0) {
         int status = 0; waitpid(pid, &status, 0);
         fprintf(stderr, "Failed to start qemu: exec failed (errno=%d)\n", child_errno);
@@ -550,17 +730,20 @@ void startVM(void) {
 void stopVM(void) {
     char accountName[128];
     if (!selectAccount(accountName)) return;
-    char userPid[PATH_MAX]; snprintf(userPid, sizeof(userPid), "%s/%s/vm.pid", ACCOUNTS_DIR, accountName);
+    char accountDir[PATH_MAX]; snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName);
+    char userPid[PATH_MAX]; snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir);
     pid_t pid = pidfile_read(userPid);
     if (!pid) { printf("No pidfile found for '%s'. Is the VM running?\n", accountName); return; }
     if (!process_is_running(pid)) {
         printf("Stale pidfile found (pid=%d). Removing pidfile.\n", (int)pid);
         if (unlink(userPid) != 0) perror("unlink pidfile");
+        stopCameraBridge(accountDir);
         return;
     }
     if (kill((pid_t)pid, SIGTERM) != 0) { perror("kill"); return; }
     if (unlink(userPid) != 0) perror("unlink pidfile");
-    printf("Sent SIGTERM to pid %d for account '%s'\n", (int)pid, accountName);
+    stopCameraBridge(accountDir);
+    printf("Sent SIGTERM to pid %d for account '%s' and stopped camera bridge\n", (int)pid, accountName);
 }
 
  
