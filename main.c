@@ -10,11 +10,13 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/select.h>
+#include <ctype.h>
 
 #define BUF_SIZE 256
 #define DEFAULT_USER "cloud"
 #define BASE_PORT 2200
 #define CONNECT_TIMEOUT_SEC 2
+#define DEFAULT_CAMERA_DEV "/dev/video0"
 
 /* Prüft, ob eine TCP-Verbindung zu host:port innerhalb timeout möglich ist. */
 static int try_connect(const char *host, int port, int timeout_sec) {
@@ -85,9 +87,42 @@ static int compute_port_for_user(const char *user) {
     return port;
 }
 
+static pid_t start_camera_stream(const char *dev, const char *ip, int cam_port) {
+    if (!dev || !*dev || !ip || cam_port <= 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork camera");
+        return -1;
+    }
+    if (pid == 0) {
+        char url[BUF_SIZE];
+        if (snprintf(url, sizeof(url), "tcp://%s:%d", ip, cam_port) >= (int)sizeof(url)) {
+            _exit(127);
+        }
+        /* ffmpeg command: v4l2 -> mjpeg -> tcp */
+        execlp("ffmpeg", "ffmpeg",
+               "-f", "v4l2",
+               "-i", dev,
+               "-f", "mjpeg",
+               "-q:v", "5",
+               "-vf", "format=yuvj422p",
+               "-loglevel", "error",
+               "-nostdin",
+               url,
+               (char *)NULL);
+        perror("ffmpeg");
+        _exit(127);
+    }
+    printf("Kamera-Stream gestartet (PID=%d) -> %s:%d\n", (int)pid, ip, cam_port);
+    return pid;
+}
+
 int main(void) {
     char ip[BUF_SIZE];
     int port = 0;
+    int cam_port = 0;
+    char cam_dev[BUF_SIZE];
+    cam_dev[0] = '\0';
     const char *user = DEFAULT_USER;
 
     printf("CLOUDPHONE OS - Server kompatibler SSH-Client\n");
@@ -102,6 +137,18 @@ int main(void) {
     /* Port automatisch berechnen (kompatibel mit server userInfo-Berechnung) */
     port = compute_port_for_user(user);
     printf("Berechneter Standard-Port für '%s': %d\n", user, port);
+
+    printf("Kamera-Port (leer = überspringen): ");
+    if (scanf("%d", &cam_port) != 1) {
+        cam_port = 0;
+    }
+    if (cam_port > 0) {
+        printf("Kamera-Device (Standard %s): ", DEFAULT_CAMERA_DEV);
+        if (scanf("%255s", cam_dev) != 1) {
+            strncpy(cam_dev, DEFAULT_CAMERA_DEV, sizeof(cam_dev));
+            cam_dev[sizeof(cam_dev)-1] = '\0';
+        }
+    }
 
     printf("Prüfe Verbindung zu %s:%d ...\n", ip, port);
     if (try_connect(ip, port, CONNECT_TIMEOUT_SEC)) {
@@ -134,6 +181,12 @@ int main(void) {
     char port_str[32];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
+    /* Kamera-Stream starten, falls gewünscht */
+    pid_t cam_pid = -1;
+    if (cam_port > 0) {
+        cam_pid = start_camera_stream(cam_dev[0] ? cam_dev : DEFAULT_CAMERA_DEV, ip, cam_port);
+    }
+
     /* Fork & exec ssh */
     pid_t pid = fork();
     if (pid < 0) {
@@ -161,6 +214,12 @@ int main(void) {
         } else {
             printf("SSH beendet (unbekannter Status).\n");
         }
+    }
+
+    if (cam_pid > 0) {
+        printf("Beende Kamera-Stream (PID=%d)\n", (int)cam_pid);
+        kill(cam_pid, SIGTERM);
+        waitpid(cam_pid, NULL, 0);
     }
 
     return 0;
