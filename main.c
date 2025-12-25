@@ -80,6 +80,31 @@ static bool normalize_ip_literal(const char *in, char *out, size_t out_sz) {
     return out[0] != '\0';
 }
 
+static bool check_host_reachable(const char *host, AppState *app) {
+    char cmd[512];
+    char normalized[BUF_SIZE];
+    if (!normalize_ip_literal(host, normalized, sizeof(normalized))) {
+        append_log(app, "Host-Adresse ungültig.");
+        return false;
+    }
+
+    char *ping_cmd = strchr(normalized, ':') ? "ping6" : "ping";
+    int ret = snprintf(cmd, sizeof(cmd), "%s -c 1 -W 1 '%s' > /dev/null 2>&1", ping_cmd, normalized);
+    if (ret < 0 || ret >= (int)sizeof(cmd)) {
+        append_log(app, "Ping-Befehl zu lang.");
+        return false;
+    }
+
+    int res = system(cmd);
+    if (res == 0) {
+        append_log(app, "✓ Host %s ist erreichbar (Ping OK)", normalized);
+        return true;
+    } else {
+        append_log(app, "✗ Host %s antwortet nicht auf Ping", normalized);
+        return false;
+    }
+}
+
 static int try_connect(const char *host_input, int port, int timeout_sec) {
     char host[BUF_SIZE];
     if (!normalize_ip_literal(host_input, host, sizeof(host))) return 0;
@@ -311,14 +336,10 @@ static void on_connect(GtkButton *btn, gpointer user_data) {
 
     char ip[BUF_SIZE];
     if (!normalize_ip_literal(ip_raw, ip, sizeof(ip))) {
-        append_log(app, "Bitte gültige IPv6-Adresse eintragen.");
+        append_log(app, "Bitte gültige IP-Adresse eintragen.");
         return;
     }
 
-    if (!ip || !*ip) {
-        append_log(app, "Bitte Server-IP eintragen.");
-        return;
-    }
     if (!user || !*user) {
         append_log(app, "Bitte Benutzer festlegen.");
         return;
@@ -337,7 +358,13 @@ static void on_connect(GtkButton *btn, gpointer user_data) {
         return;
     }
 
-    append_log(app, "Prüfe %s:%d ...", ip, port);
+    append_log(app, "Prüfe Host %s ...", ip);
+    if (!check_host_reachable(ip, app)) {
+        append_log(app, "Host antwortet nicht. Verbindung abgebrochen.");
+        return;
+    }
+
+    append_log(app, "Prüfe Port %d ...", port);
     if (!try_connect(ip, port, CONNECT_TIMEOUT_SEC)) {
         append_log(app, "Port %d nicht erreichbar.", port);
         return;
