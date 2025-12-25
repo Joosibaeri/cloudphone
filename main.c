@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gtk/gtk.h>
@@ -61,15 +62,39 @@ static int compute_port_for_user(const char *user) {
     return port;
 }
 
-static int try_connect(const char *host, int port, int timeout_sec) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+static bool normalize_ip_literal(const char *in, char *out, size_t out_sz) {
+    if (!in || !out || out_sz == 0) return false;
+    while (*in && isspace((unsigned char)*in)) in++;
+    size_t len = strnlen(in, out_sz);
+    if (len == out_sz) return false;
+    while (len > 0 && isspace((unsigned char)in[len - 1])) len--;
+    if (len + 1 > out_sz) return false;
+    memcpy(out, in, len);
+    out[len] = '\0';
+    if (len >= 2 && out[0] == '[' && out[len - 1] == ']') {
+        memmove(out, out + 1, len - 2);
+        out[len - 2] = '\0';
+    }
+    char *zone = strchr(out, '%');
+    if (zone) *zone = '\0';
+    return out[0] != '\0';
+}
+
+static int try_connect(const char *host_input, int port, int timeout_sec) {
+    char host[BUF_SIZE];
+    if (!normalize_ip_literal(host_input, host, sizeof(host))) return 0;
+
+    int s = socket(AF_INET6, SOCK_STREAM, 0);
     if (s < 0) return 0;
 
-    struct sockaddr_in addr;
+    int one = 1;
+    (void)setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET6, host, &addr.sin6_addr) != 1) {
         close(s);
         return 0;
     }
@@ -177,11 +202,19 @@ static void on_ssh_exit(GPid pid, gint status, gpointer data) {
     gtk_widget_set_sensitive(app->btn_stop, FALSE);
 }
 
-static bool start_camera(AppState *app, const char *ip, int cam_port, const char *dev) {
+static bool start_camera(AppState *app, const char *ip_input, int cam_port, const char *dev) {
     if (cam_port <= 0) return true;
 
+    char ip[BUF_SIZE];
+    if (!normalize_ip_literal(ip_input, ip, sizeof(ip))) {
+        append_log(app, "Ungültige IP-Adresse für Kamera.");
+        return false;
+    }
+
+    bool needs_brackets = strchr(ip, ':') != NULL;
     char url[BUF_SIZE];
-    if (snprintf(url, sizeof(url), "tcp://%s:%d", ip, cam_port) >= (int)sizeof(url)) {
+    const char *fmt = needs_brackets ? "tcp://[%s]:%d" : "tcp://%s:%d";
+    if (snprintf(url, sizeof(url), fmt, ip, cam_port) >= (int)sizeof(url)) {
         append_log(app, "Kamera-URL zu lang.");
         return false;
     }
@@ -211,9 +244,17 @@ static bool start_camera(AppState *app, const char *ip, int cam_port, const char
     return true;
 }
 
-static bool start_ssh(AppState *app, const char *user, const char *ip, int port) {
+static bool start_ssh(AppState *app, const char *user, const char *ip_input, int port) {
+    char ip[BUF_SIZE];
+    if (!normalize_ip_literal(ip_input, ip, sizeof(ip))) {
+        append_log(app, "Ungültige IP-Adresse.");
+        return false;
+    }
+
+    bool needs_brackets = strchr(ip, ':') != NULL;
     char target[BUF_SIZE * 2];
-    if (snprintf(target, sizeof(target), "%s@%s", user, ip) >= (int)sizeof(target)) {
+    const char *fmt = needs_brackets ? "%s@[%s]" : "%s@%s";
+    if (snprintf(target, sizeof(target), fmt, user, ip) >= (int)sizeof(target)) {
         append_log(app, "Zielangabe zu lang.");
         return false;
     }
@@ -223,6 +264,7 @@ static bool start_ssh(AppState *app, const char *user, const char *ip, int port)
 
     gchar *argv[] = {
         "ssh",
+        "-6",
         "-T",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
@@ -261,11 +303,17 @@ static void on_connect(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *app = user_data;
 
-    const char *ip = gtk_entry_get_text(GTK_ENTRY(app->entry_ip));
+    const char *ip_raw = gtk_entry_get_text(GTK_ENTRY(app->entry_ip));
     const char *user = gtk_entry_get_text(GTK_ENTRY(app->entry_user));
     const char *port_txt = gtk_entry_get_text(GTK_ENTRY(app->entry_port));
     const char *cam_port_txt = gtk_entry_get_text(GTK_ENTRY(app->entry_cam_port));
     const char *cam_dev = gtk_entry_get_text(GTK_ENTRY(app->entry_cam_dev));
+
+    char ip[BUF_SIZE];
+    if (!normalize_ip_literal(ip_raw, ip, sizeof(ip))) {
+        append_log(app, "Bitte gültige IPv6-Adresse eintragen.");
+        return;
+    }
 
     if (!ip || !*ip) {
         append_log(app, "Bitte Server-IP eintragen.");
@@ -354,8 +402,8 @@ int main(int argc, char **argv) {
     gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
     gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
 
-    GtkWidget *lbl_ip = gtk_label_new("Server-IP");
-    app.entry_ip = build_entry("z.B. 192.168.1.10", "");
+    GtkWidget *lbl_ip = gtk_label_new("Server-IP (IPv6)");
+    app.entry_ip = build_entry("z.B. 2001:db8::1", "");
     gtk_grid_attach(GTK_GRID(grid), lbl_ip, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), app.entry_ip, 1, 0, 2, 1);
 
