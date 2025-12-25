@@ -399,14 +399,19 @@ void stopCameraBridge(const char *accountDir) {
 
  
 int findFreePort(void) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = socket(AF_INET6, SOCK_STREAM, 0);
     if (s < 0) return -1;
-    struct sockaddr_in addr;
+
+    int one = 1;
+    (void)setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_loopback;
+
     for (int p = 2200; p <= 65535; ++p) {
-        addr.sin_port = htons(p);
+        addr.sin6_port = htons(p);
         int b = bind(s, (struct sockaddr*)&addr, sizeof(addr));
         if (b == 0) {
             close(s);
@@ -598,24 +603,45 @@ printf("Base image updated to %s\n", VM_BASE_QCOW2);
 
 void showServerIP(void) {
     struct ifaddrs *ifaddr, *ifa;
+    char found[INET6_ADDRSTRLEN] = "";
+
     if (getifaddrs(&ifaddr) == -1) {
-        printf("Server IP: 127.0.0.1 (fallback)\n");
+        printf("Server IP: ::1 (fallback)\n");
         return;
     }
+
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr) continue;
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            char host[INET_ADDRSTRLEN];
-            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-            if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == NULL) continue;
-            if (strncmp(host, "127.", 4) == 0) continue;
-            printf("Server IP: %s\n", host);
-            freeifaddrs(ifaddr);
-            return;
+        if (ifa->ifa_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+            if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) continue;
+            if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) continue;
+            char host[INET6_ADDRSTRLEN];
+            if (inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host)) == NULL) continue;
+            strncpy(found, host, sizeof(found));
+            found[sizeof(found) - 1] = '\0';
+            break;
         }
     }
+
+    if (!found[0]) {
+        for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr) continue;
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                char host[INET_ADDRSTRLEN];
+                struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+                if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == NULL) continue;
+                if (strncmp(host, "127.", 4) == 0) continue;
+                strncpy(found, host, sizeof(found));
+                found[sizeof(found) - 1] = '\0';
+                break;
+            }
+        }
+    }
+
     freeifaddrs(ifaddr);
-    printf("Server IP: 127.0.0.1 (fallback)\n");
+    if (found[0]) printf("Server IP: %s\n", found);
+    else printf("Server IP: ::1 (fallback)\n");
 }
  
 
@@ -680,7 +706,7 @@ void startVM(void) {
           
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
-                char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp::%d-:22", sshPort);
+                char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:[::1]:%d-:22", sshPort);
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
                 char virtfs[PATH_MAX + 96]; snprintf(virtfs, sizeof(virtfs), "local,id=hostshare,path=%s,security_model=none,mount_tag=hostshare", accountDir);
                 char *const argv[] = {

@@ -15,3 +15,8 @@ make         # builds `main` from main.c
 If you want the compatibility name used previously, `make cloudphone_server` will produce an executable named `cloudphone_server`.
 
 CloudPhone is designed for controlled environments, keeping the client minimal while the server handles most of the logic and data management.
+
+IPv6
+-----
+- Host-side forwarding now binds to IPv6 loopback (`[::1]`) for SSH access to the guest; choose your host port from the startup log and connect with `ssh -6 -p <port> cloud@::1` (or the printed IPv6 address if reachable externally).
+- Dynamic port allocation and helper processes use IPv6-only bindings; ensure clients reach the server via IPv6.
