@@ -17,17 +17,19 @@
 #include <netdb.h>
 #include <ifaddrs.h>
 
-#define ACCOUNTS_DIR "./vm/userdata/accounts"
-#define BASE_DIR "./vm"
-#define VM_BASE_QCOW2 "./vm/base.qcow2"
-#define VM_LAUNCH_BIN "./vm/launch"
-#define VM_PROVISIONER "./vm/provision_base.sh"
-#define BASE_PROVISION_STAMP "./vm/base.provisioned"
+#define ACCOUNTS_DIR "./vm/userdata/accounts"   /* per-account folders */
+#define BASE_DIR "./vm"                          /* shared VM assets */
+#define VM_BASE_QCOW2 "./vm/base.qcow2"         /* base qcow2 image */
+#define VM_LAUNCH_BIN "./vm/launch"             /* helper binary to copy */
+#define VM_PROVISIONER "./vm/provision_base.sh"  /* script that provisions base */
+#define BASE_PROVISION_STAMP "./vm/base.provisioned" /* stamp to avoid re-provision */
+#define SSH_PORT_FILE "ssh.port"
 #define CAMERA_OUT_NAME "camera.mjpg"
 #define CAMERA_LOG_NAME "cam.log"
 #define CAMERA_PID_NAME "cam.pid"
 #define CAMERA_PORT_FILE "camera.port"
 
+/* core commands */
 int selectAccount(char *accountName);
 int ensureBaseImage(void);
 int ensureBaseProvisioned(void);
@@ -40,20 +42,21 @@ void userInfo(void);
 void cloneUser(void);
 void resetUser(void);
 void rebuildBase(void);
+pid_t startCameraBridge(const char *accountDir, int preferredStartPort, int *outPort);
 void startVM(void);
 void stopVM(void);
  
 int deployLaunchBinary(const char *accountDir);
-pid_t startCameraBridge(const char *accountDir, int *outPort);
 void stopCameraBridge(const char *accountDir);
 
+/* helpers */
 void changeimg(void);
-int findFreePort(void);
+int findFreePortFrom(int startPort);
  
 void showHelp(void);
 void menu(void);
 
-/* ask confirmation, default YES on empty input */
+/* ask confirmation from stdin; empty input counts as YES */
 static int ask_yes_default_yes(const char *prompt) {
     char buf[32];
     printf("%s", prompt);
@@ -70,6 +73,7 @@ void showServerIP(void);
 static pid_t pidfile_read(const char *path);
 static int process_is_running(pid_t pid);
 
+/* recursively create a directory path (mkdir -p behavior) */
 static int ensure_dir(const char *path) {
     if (!path || !*path) { errno = EINVAL; return -1; }
     char tmp[PATH_MAX];
@@ -90,6 +94,7 @@ static int ensure_dir(const char *path) {
     return 0;
 }
 
+/* read pid from a pidfile; returns 0 on error */
 static pid_t pidfile_read(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -100,6 +105,7 @@ static pid_t pidfile_read(const char *path) {
     return (pid_t)p;
 }
 
+/* check if a pid is alive, treating EPERM as alive */
 static int process_is_running(pid_t pid) {
     if (pid <= 0) return 0;
     if (kill(pid, 0) == 0) return 1;
@@ -107,6 +113,7 @@ static int process_is_running(pid_t pid) {
     return 0;
 }
 
+/* prompt user for an account name and verify it exists */
 int selectAccount(char *accountName) {
     listAccounts();
     printf("Enter account name: ");
@@ -124,6 +131,7 @@ int selectAccount(char *accountName) {
 }
 
  
+/* ensure base qcow2 exists; download if missing, then provision */
 int ensureBaseImage(void) {
     if (ensure_dir(BASE_DIR) != 0) { perror("mkdir base"); return -1; }
 
@@ -140,6 +148,7 @@ int ensureBaseImage(void) {
     return ensureBaseProvisioned();
 }
 
+/* run provisioning script once and write a stamp file on success */
 int ensureBaseProvisioned(void) {
     struct stat st;
     if (stat(BASE_PROVISION_STAMP, &st) == 0) return 0;
@@ -171,6 +180,7 @@ int ensureBaseProvisioned(void) {
 }
 
  
+/* list existing account directories */
 void listAccounts(void) {
     struct dirent *entry;
     DIR *dp = opendir(ACCOUNTS_DIR);
@@ -188,12 +198,14 @@ void listAccounts(void) {
 }
 
  
+/* make sure the accounts root directory exists */
 int ensureAccountsFolder(void) {
     if (ensure_dir(ACCOUNTS_DIR) != 0) { perror("mkdir accounts"); return -1; }
     return 0;
 }
 
  
+/* allow only safe account names (alnum + -_. and no slashes) */
 static int validateName(const char *name) {
     if (!name || !*name) return 0;
     if (strchr(name, '/')) return 0;
@@ -205,6 +217,7 @@ static int validateName(const char *name) {
 }
 
  
+/* copy a single file, overwriting destination */
 static int copyFile(const char *src, const char *dst) {
     int in = open(src, O_RDONLY);
     if (in < 0) return -1;
@@ -221,6 +234,7 @@ static int copyFile(const char *src, const char *dst) {
 }
 
  
+/* rm -rf equivalent for files, dirs, and symlinks */
 static int remove_recursive(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) { perror("lstat"); return -1; }
@@ -245,6 +259,7 @@ static int remove_recursive(const char *path) {
 }
 
  
+/* cp -a equivalent: recurse, preserve symlinks and modes */
 static int copy_recursive(const char *src, const char *dst) {
     struct stat st;
     if (lstat(src, &st) != 0) { perror("lstat src"); return -1; }
@@ -287,6 +302,17 @@ static int copy_recursive(const char *src, const char *dst) {
     return (r == 0) ? 0 : -1;
 }
 
+/* write an integer with trailing newline to a file */
+static int read_int_file(const char *path, int *out) {
+    if (!out) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int v = 0; int rc = fscanf(f, "%d", &v);
+    fclose(f);
+    if (rc == 1) { *out = v; return 0; }
+    return -1;
+}
+
 static int write_int_file(const char *path, int value) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return -1;
@@ -297,6 +323,7 @@ static int write_int_file(const char *path, int value) {
     return (w == len) ? 0 : -1;
 }
 
+/* copy the launch helper binary into a user directory */
 int deployLaunchBinary(const char *accountDir) {
     char dst[PATH_MAX];
     if (snprintf(dst, sizeof(dst), "%s/launch", accountDir) >= (int)sizeof(dst)) return -1;
@@ -312,7 +339,8 @@ int deployLaunchBinary(const char *accountDir) {
     return 0;
 }
 
-pid_t startCameraBridge(const char *accountDir, int *outPort) {
+/* start the per-account camera bridge via launch helper; returns pid */
+pid_t startCameraBridge(const char *accountDir, int preferredStartPort, int *outPort) {
     char bin[PATH_MAX], out[PATH_MAX], logp[PATH_MAX], pidp[PATH_MAX], portfile[PATH_MAX];
     if (snprintf(bin, sizeof(bin), "%s/launch", accountDir) >= (int)sizeof(bin)) return -1;
     if (snprintf(out, sizeof(out), "%s/%s", accountDir, CAMERA_OUT_NAME) >= (int)sizeof(out)) return -1;
@@ -333,7 +361,7 @@ pid_t startCameraBridge(const char *accountDir, int *outPort) {
         return -1;
     }
 
-    int port = findFreePort();
+    int port = findFreePortFrom(preferredStartPort);
     if (port <= 0) {
         fprintf(stderr, "No free port for camera bridge\n");
         return -1;
@@ -385,6 +413,7 @@ pid_t startCameraBridge(const char *accountDir, int *outPort) {
     return -1;
 }
 
+/* stop camera bridge if running and clean pid/port files */
 void stopCameraBridge(const char *accountDir) {
     char pidp[PATH_MAX], portfile[PATH_MAX];
     if (snprintf(pidp, sizeof(pidp), "%s/%s", accountDir, CAMERA_PID_NAME) >= (int)sizeof(pidp)) return;
@@ -398,19 +427,21 @@ void stopCameraBridge(const char *accountDir) {
 }
 
  
-int findFreePort(void) {
+/* bind-scan for a free TCP port on all interfaces starting at startPort */
+int findFreePortFrom(int startPort) {
     int s = socket(AF_INET6, SOCK_STREAM, 0);
     if (s < 0) return -1;
 
-    int one = 1;
-    (void)setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+    int v6only = 0;
+    (void)setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
-    addr.sin6_addr = in6addr_loopback;
+    addr.sin6_addr = in6addr_any;
 
-    for (int p = 2200; p <= 65535; ++p) {
+    if (startPort < 1) startPort = 1;
+    for (int p = startPort; p <= 65535; ++p) {
         addr.sin6_port = htons(p);
         int b = bind(s, (struct sockaddr*)&addr, sizeof(addr));
         if (b == 0) {
@@ -421,6 +452,7 @@ int findFreePort(void) {
     close(s);
     return -1;
 }
+/* create a new account directory, copy base qcow2, and deploy helper */
 void createUser(void) {
     if (ensureAccountsFolder() != 0) { printf("accounts folder missing and cannot be created\n"); return; }
     char name[128];
@@ -444,6 +476,7 @@ void createUser(void) {
     printf("Account '%s' created at %s\n", name, accountPath);
 }
 
+/* delete an account after confirming and ensuring its VM is not running */
 void removeUser(void) {
     char name[50];
     printf("Enter account name to delete: ");
@@ -474,6 +507,7 @@ void removeUser(void) {
     printf("Account '%s' deleted.\n", name);
 }
 
+/* quick existence check for an account */
 void checkUser(void) {
     char name[128]; printf("Enter account name to check: ");
     if (!fgets(name, sizeof(name), stdin)) return;
@@ -482,6 +516,7 @@ void checkUser(void) {
     DIR *d = opendir(accountPath); if (d) { closedir(d); printf("Account '%s' exists.\n", name); } else printf("Account '%s' does not exist.\n", name);
 }
 
+/* print account disk path and (persisted) SSH port if known */
 void userInfo(void) {
     char name[128]; printf("Enter account name: ");
     if (!fgets(name, sizeof(name), stdin)) return;
@@ -490,11 +525,19 @@ void userInfo(void) {
     DIR *d = opendir(accountPath); if (!d) { printf("Account '%s' does not exist.\n", name); return; } closedir(d);
     char disk[PATH_MAX * 2];
     if (snprintf(disk, sizeof(disk), "%s/disk.qcow2", accountPath) >= (int)sizeof(disk)) { printf("Internal path too long\n"); return; }
-    int port = 2200;
-    for (int i = 0; name[i]; i++) port += (unsigned char)name[i];
+    int port = -1;
+    char sshportpath[PATH_MAX];
+    if (snprintf(sshportpath, sizeof(sshportpath), "%s/%s", accountPath, SSH_PORT_FILE) < (int)sizeof(sshportpath)) {
+        (void)read_int_file(sshportpath, &port);
+    }
+    if (port <= 0) {
+        port = 2200;
+        for (int i = 0; name[i]; i++) port += (unsigned char)name[i];
+    }
     printf("User: %s\nDisk: %s\nSSH Port: %d\nDisk exists: %s\n", name, disk, port, access(disk, F_OK) == 0 ? "yes" : "no");
 }
 
+/* deep copy an existing account to a new name */
 void cloneUser(void) {
     char src[128], dest[128]; printf("Enter source user: ");
     if (!fgets(src, sizeof(src), stdin)) return;
@@ -514,6 +557,7 @@ void cloneUser(void) {
     printf("User '%s' cloned to '%s'.\n", src, dest);
 }
 
+/* replace an account's disk with a fresh copy of the base image */
 void resetUser(void) {
     char name[128];
     printf("Enter account to reset: ");
@@ -541,6 +585,7 @@ void resetUser(void) {
 }
 
 
+/* redownload and reprovision the shared base image */
 void rebuildBase(void) {
     printf("Rebuilding base image...\n");
     if (access(VM_BASE_QCOW2, F_OK) == 0) { if (unlink(VM_BASE_QCOW2) != 0) perror("unlink base"); }
@@ -549,6 +594,7 @@ void rebuildBase(void) {
 }
 
  
+/* download a user-specified qcow2 URL to become the new base image */
 void changeimg(void) {
     char url[2048];
     printf("Enter image URL (http(s)://...): ");
@@ -601,6 +647,7 @@ printf("Base image updated to %s\n", VM_BASE_QCOW2);
 
 }
 
+/* find a non-loopback IPv6/IPv4 address to advertise to users */
 void showServerIP(void) {
     struct ifaddrs *ifaddr, *ifa;
     char found[INET6_ADDRSTRLEN] = "";
@@ -645,6 +692,7 @@ void showServerIP(void) {
 }
  
 
+/* start a VM for a selected account with SSH port forwarding and camera bridge */
 void startVM(void) {
     if (access("/usr/bin/qemu-system-x86_64", X_OK) != 0) {
         fprintf(stderr, "QEMU is not installed or not in PATH\n");
@@ -681,11 +729,26 @@ void startVM(void) {
         fprintf(stderr, "Warning: launch helper not deployed to %s\n", accountDir);
     }
 
-    int sshPort = findFreePort();
+    int sshPort = -1;
+    char sshportpath[PATH_MAX];
+    if (snprintf(sshportpath, sizeof(sshportpath), "%s/%s", accountDir, SSH_PORT_FILE) >= (int)sizeof(sshportpath)) { printf("Internal path too long\n"); return; }
+
+    int storedPort = -1;
+    (void)read_int_file(sshportpath, &storedPort);
+
+    if (storedPort > 0) {
+        sshPort = findFreePortFrom(storedPort);
+    } else {
+        sshPort = findFreePortFrom(2200);
+    }
+
     if (sshPort <= 0) { printf("No free ports available for SSH\n"); return; }
+    if (write_int_file(sshportpath, sshPort) != 0) {
+        fprintf(stderr, "Warning: could not persist ssh port to %s\n", sshportpath);
+    }
 
     int cameraPort = -1;
-    pid_t camPid = startCameraBridge(accountDir, &cameraPort);
+    pid_t camPid = startCameraBridge(accountDir, sshPort + 1, &cameraPort);
     if (camPid <= 0) {
         fprintf(stderr, "Warning: camera bridge not started for '%s'\n", accountName);
     }
@@ -706,7 +769,8 @@ void startVM(void) {
           
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
-                char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:[::1]:%d-:22", sshPort);
+                /* listen on all interfaces so SSH can be reached remotely; tighten firewall if needed */
+                char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:[::]:%d-:22", sshPort);
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
                 char virtfs[PATH_MAX + 96]; snprintf(virtfs, sizeof(virtfs), "local,id=hostshare,path=%s,security_model=none,mount_tag=hostshare", accountDir);
                 char *const argv[] = {
@@ -753,6 +817,7 @@ void startVM(void) {
     int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
 }
 
+/* stop VM and camera bridge for a selected account */
 void stopVM(void) {
     char accountName[128];
     if (!selectAccount(accountName)) return;
@@ -773,6 +838,7 @@ void stopVM(void) {
 }
 
  
+/* print the interactive command list */
 void showHelp(void) {
     printf("\nAvailable commands:\n");
     printf("checkuser     - Check if an account exists\n");
@@ -780,7 +846,7 @@ void showHelp(void) {
     printf("createuser    - Create new account\n");
     printf("exit          - Exit terminal\n");
     printf("help          - Show this help\n");
-    printf("listuser      - List accounts\n");
+    printf("listuser      - List accounts\n");   
     printf("rebuildbase   - Redownload the base qcow2 image\n");
     printf("removeuser    - Delete an account\n");
     printf("resetuser     - Reset a user's disk.qcow2 from base\n");
@@ -791,6 +857,7 @@ void showHelp(void) {
     printf("userinfo      - Show info about a user\n\n");
 }
 
+/* REPL-style command loop */
 void menu(void) {
     char input[64];
     printf("For help type 'help'\n");
@@ -821,6 +888,7 @@ void menu(void) {
     }
 }
 
+/* entry point: ensure folders/base exist, then enter menu loop */
 int main(void) {
     
     if (ensureAccountsFolder() != 0) {
