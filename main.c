@@ -17,6 +17,15 @@
 #include <netdb.h>
 #include <ifaddrs.h>
 
+/*
+ * Small CLI to manage per-user QEMU VMs and their camera bridge.
+ * Responsibilities:
+ * - Prepare a shared base qcow2 image (download + provisioning stamp)
+ * - Manage per-account data in ./vm/userdata/accounts/<name>
+ * - Start/stop VMs with SSH port forwarding and camera MJPEG bridge
+ * - Provide a REPL with helper commands (create, clone, reset, delete)
+ */
+
 #define ACCOUNTS_DIR "./vm/userdata/accounts"   /* per-account folders */
 #define BASE_DIR "./vm"                          /* shared VM assets */
 #define VM_BASE_QCOW2 "./vm/base.qcow2"         /* base qcow2 image */
@@ -131,7 +140,12 @@ int selectAccount(char *accountName) {
 }
 
  
-/* ensure base qcow2 exists; download if missing, then provision */
+/*
+ * Ensure a base qcow2 exists at VM_BASE_QCOW2.
+ * - mkdir -p ./vm
+ * - download the current Debian cloud image if missing
+ * - run provisioning once (stamp file prevents re-run)
+ */
 int ensureBaseImage(void) {
     if (ensure_dir(BASE_DIR) != 0) { perror("mkdir base"); return -1; }
 
@@ -148,7 +162,10 @@ int ensureBaseImage(void) {
     return ensureBaseProvisioned();
 }
 
-/* run provisioning script once and write a stamp file on success */
+/*
+ * Run provisioning script against the base image exactly once.
+ * A success stamp is written to BASE_PROVISION_STAMP to skip future runs.
+ */
 int ensureBaseProvisioned(void) {
     struct stat st;
     if (stat(BASE_PROVISION_STAMP, &st) == 0) return 0;
@@ -198,7 +215,7 @@ void listAccounts(void) {
 }
 
  
-/* make sure the accounts root directory exists */
+/* Create ./vm/userdata/accounts if needed (mkdir -p semantics). */
 int ensureAccountsFolder(void) {
     if (ensure_dir(ACCOUNTS_DIR) != 0) { perror("mkdir accounts"); return -1; }
     return 0;
@@ -339,7 +356,13 @@ int deployLaunchBinary(const char *accountDir) {
     return 0;
 }
 
-/* start the per-account camera bridge via launch helper; returns pid */
+/*
+ * Start the per-account camera bridge via the bundled launch helper.
+ * - Reuses an already-running bridge if pidfile is alive
+ * - Picks a free TCP port (preferring preferredStartPort)
+ * - Persists port/pid files next to the account
+ * - Returns the child pid or -1 on failure
+ */
 pid_t startCameraBridge(const char *accountDir, int preferredStartPort, int *outPort) {
     char bin[PATH_MAX], out[PATH_MAX], logp[PATH_MAX], pidp[PATH_MAX], portfile[PATH_MAX];
     if (snprintf(bin, sizeof(bin), "%s/launch", accountDir) >= (int)sizeof(bin)) return -1;
@@ -452,7 +475,10 @@ int findFreePortFrom(int startPort) {
     close(s);
     return -1;
 }
-/* create a new account directory, copy base qcow2, and deploy helper */
+/*
+ * Create a new account directory with a fresh disk copy and helper binary.
+ * The launch helper is copied so per-account processes can run locally.
+ */
 void createUser(void) {
     if (ensureAccountsFolder() != 0) { printf("accounts folder missing and cannot be created\n"); return; }
     char name[128];
@@ -476,7 +502,10 @@ void createUser(void) {
     printf("Account '%s' created at %s\n", name, accountPath);
 }
 
-/* delete an account after confirming and ensuring its VM is not running */
+/*
+ * Delete an account after confirmation and only if its VM is not running.
+ * Also removes per-account camera artifacts.
+ */
 void removeUser(void) {
     char name[50];
     printf("Enter account name to delete: ");
@@ -537,7 +566,7 @@ void userInfo(void) {
     printf("User: %s\nDisk: %s\nSSH Port: %d\nDisk exists: %s\n", name, disk, port, access(disk, F_OK) == 0 ? "yes" : "no");
 }
 
-/* deep copy an existing account to a new name */
+/* Deep copy an existing account directory to a new account name. */
 void cloneUser(void) {
     char src[128], dest[128]; printf("Enter source user: ");
     if (!fgets(src, sizeof(src), stdin)) return;
@@ -557,7 +586,7 @@ void cloneUser(void) {
     printf("User '%s' cloned to '%s'.\n", src, dest);
 }
 
-/* replace an account's disk with a fresh copy of the base image */
+/* Replace an account's disk with a fresh base image copy (keeps other files). */
 void resetUser(void) {
     char name[128];
     printf("Enter account to reset: ");
@@ -585,7 +614,7 @@ void resetUser(void) {
 }
 
 
-/* redownload and reprovision the shared base image */
+/* Redownload and re-provision the shared base image unconditionally. */
 void rebuildBase(void) {
     printf("Rebuilding base image...\n");
     if (access(VM_BASE_QCOW2, F_OK) == 0) { if (unlink(VM_BASE_QCOW2) != 0) perror("unlink base"); }
@@ -594,7 +623,10 @@ void rebuildBase(void) {
 }
 
  
-/* download a user-specified qcow2 URL to become the new base image */
+/*
+ * Download a user-specified qcow2 URL to become the new base image.
+ * Uses curl (or wget fallback), writes to a temp file, then atomically renames.
+ */
 void changeimg(void) {
     char url[2048];
     printf("Enter image URL (http(s)://...): ");
@@ -692,7 +724,15 @@ void showServerIP(void) {
 }
  
 
-/* start a VM for a selected account with SSH port forwarding and camera bridge */
+/*
+ * Start a VM for a chosen account with SSH port forwarding and camera bridge.
+ * Steps:
+ * - Validate base image presence and copy per-account disk if missing
+ * - Reserve/persist a free SSH port (ipv4/ipv6 listen)
+ * - Start camera bridge on the next port
+ * - Spawn qemu headless with virtio disk and shared folder
+ * - Write pid/log files to the account directory
+ */
 void startVM(void) {
     if (access("/usr/bin/qemu-system-x86_64", X_OK) != 0) {
         fprintf(stderr, "QEMU is not installed or not in PATH\n");
@@ -817,7 +857,7 @@ void startVM(void) {
     int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
 }
 
-/* stop VM and camera bridge for a selected account */
+/* Stop VM and camera bridge for a selected account, cleaning pid files. */
 void stopVM(void) {
     char accountName[128];
     if (!selectAccount(accountName)) return;
