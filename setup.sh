@@ -52,7 +52,7 @@ tmp=$(mktemp "${BASE_DIR}/baseimg.XXXXXX") || { echo "Failed to create temporary
 if command -v curl >/dev/null 2>&1; then
     curl -L --fail -o "$tmp" "$URL" || { echo "Download failed"; rm -f "$tmp"; exit 1; }
 elif command -v wget >/dev/null 2>&1; then
-    wget -O "$tmp" "$URL" || { echo "Download failed"; rm -f "$tmp"; exit 1; }
+    wget -q -O "$tmp" -o /dev/null "$URL" || { echo "Download failed"; rm -f "$tmp"; exit 1; }
 else
     echo "Error: neither curl nor wget is available to download images." >&2
     exit 1

@@ -16,6 +16,8 @@
 #include <signal.h>
 #include <netdb.h>
 #include <ifaddrs.h>
+#include <ctype.h>
+#include <strings.h>
 
 /*
  * Small CLI to manage per-user QEMU VMs and their camera bridge.
@@ -31,12 +33,24 @@
 #define VM_BASE_QCOW2 "./vm/base.qcow2"         /* base qcow2 image */
 #define VM_LAUNCH_BIN "./vm/launch"             /* helper binary to copy */
 #define VM_PROVISIONER "./vm/provision_base.sh"  /* script that provisions base */
-#define BASE_PROVISION_STAMP "./vm/base.provisioned" /* stamp to avoid re-provision */
 #define SSH_PORT_FILE "ssh.port"
 #define CAMERA_OUT_NAME "camera.mjpg"
 #define CAMERA_LOG_NAME "cam.log"
 #define CAMERA_PID_NAME "cam.pid"
 #define CAMERA_PORT_FILE "camera.port"
+#define CONFIG_PATH "./config.cfg"
+
+#define DEFAULT_BASE_IMAGE_URL "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+#define DEFAULT_IP_MODE "ipv6"
+
+enum ip_mode { IP_MODE_IPV6 = 0, IP_MODE_IPV4 = 1 };
+
+struct Config {
+    char base_image_url[PATH_MAX];
+    enum ip_mode ip_mode;
+};
+
+static struct Config g_cfg = { DEFAULT_BASE_IMAGE_URL, IP_MODE_IPV6 };
 
 /* core commands */
 int selectAccount(char *accountName);
@@ -59,11 +73,11 @@ int deployLaunchBinary(const char *accountDir);
 void stopCameraBridge(const char *accountDir);
 
 /* helpers */
-void changeimg(void);
 int findFreePortFrom(int startPort);
  
 void showHelp(void);
 void menu(void);
+void loadConfig(void);
 
 /* ask confirmation from stdin; empty input counts as YES */
 static int ask_yes_default_yes(const char *prompt) {
@@ -81,6 +95,8 @@ void showServerIP(void);
 /* pidfile helpers */
 static pid_t pidfile_read(const char *path);
 static int process_is_running(pid_t pid);
+static void trim_trailing_ws(char *s);
+static void trim_leading_ws(char **p);
 
 /* recursively create a directory path (mkdir -p behavior) */
 static int ensure_dir(const char *path) {
@@ -101,6 +117,22 @@ static int ensure_dir(const char *path) {
         if (errno != EEXIST) return -1;
     }
     return 0;
+}
+
+/* drop trailing whitespace (including newlines) in-place */
+static void trim_trailing_ws(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[len - 1] = '\0';
+        --len;
+    }
+}
+
+/* advance pointer past leading whitespace */
+static void trim_leading_ws(char **p) {
+    if (!p || !*p) return;
+    while (**p && isspace((unsigned char)**p)) (*p)++;
 }
 
 /* read pid from a pidfile; returns 0 on error */
@@ -153,8 +185,9 @@ int ensureBaseImage(void) {
         char tmp[PATH_MAX];
         snprintf(tmp, sizeof(tmp), "%s/debian-cloudimg.qcow2", BASE_DIR);
         fprintf(stderr, "Base qcow2 not found at %s. Attempting download...\n", VM_BASE_QCOW2);
+        const char *url = g_cfg.base_image_url[0] ? g_cfg.base_image_url : DEFAULT_BASE_IMAGE_URL;
         char cmd[PATH_MAX * 2];
-        int r = snprintf(cmd, sizeof(cmd), "wget -O '%s' https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2", tmp);
+        int r = snprintf(cmd, sizeof(cmd), "wget -q -O '%s' -o /dev/null '%s'", tmp, url);
         if (r < 0 || r >= (int)sizeof(cmd)) { fprintf(stderr, "URL too long for command buffer\n"); return -1; }
         if (system(cmd) != 0) { fprintf(stderr, "Failed to download base image\n"); return -1; }
         if (rename(tmp, VM_BASE_QCOW2) != 0) perror("rename base image");
@@ -167,8 +200,8 @@ int ensureBaseImage(void) {
  * A success stamp is written to BASE_PROVISION_STAMP to skip future runs.
  */
 int ensureBaseProvisioned(void) {
-    struct stat st;
-    if (stat(BASE_PROVISION_STAMP, &st) == 0) return 0;
+    static int already_ran = 0;
+    if (already_ran) return 0;
 
     if (access(VM_PROVISIONER, X_OK) != 0) {
         fprintf(stderr, "Provisioner script missing or not executable: %s\n", VM_PROVISIONER);
@@ -186,13 +219,7 @@ int ensureBaseProvisioned(void) {
         fprintf(stderr, "Provisioner failed with code %d\n", rc);
         return -1;
     }
-
-    int fd = open(BASE_PROVISION_STAMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        const char *msg = "provisioned\n";
-        (void)write(fd, msg, strlen(msg));
-        close(fd);
-    }
+    already_ran = 1;
     return 0;
 }
 
@@ -487,6 +514,11 @@ void createUser(void) {
         return;
     }
     name[strcspn(name, "\n")] = 0;
+    int only_ws = 1;
+    for (char *p = name; *p; ++p) {
+        if (!isspace((unsigned char)*p)) { only_ws = 0; break; }
+    }
+    if (name[0] == '\0' || only_ws) { printf("No account name provided\n"); return; }
     if (!validateName(name)) { printf("Invalid account name\n"); return; }
     char accountPath[PATH_MAX];
     if (snprintf(accountPath, sizeof(accountPath), "%s/%s", ACCOUNTS_DIR, name) >= (int)sizeof(accountPath)) { printf("Name too long\n"); return; }
@@ -622,67 +654,11 @@ void rebuildBase(void) {
     printf("Base image rebuilt.\n");
 }
 
- 
-/*
- * Download a user-specified qcow2 URL to become the new base image.
- * Uses curl (or wget fallback), writes to a temp file, then atomically renames.
- */
-void changeimg(void) {
-    char url[2048];
-    printf("Enter image URL (http(s)://...): ");
-    if (!fgets(url, sizeof(url), stdin)) return;
-    url[strcspn(url, "\n")] = 0;
-    if (!url[0]) { printf("No URL provided\n"); return; }
-    if (!(strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0)) {
-        printf("Only http:// or https:// URLs are supported\n");
-        return;
-    }
-    if (strchr(url, '\'') != NULL) { printf("URL contains invalid character '\''\n"); return; }
-
-    
-    if (ensure_dir(BASE_DIR) != 0) { perror("mkdir base"); return; }
-
-        
-        char tmp_template[PATH_MAX];
-        if (snprintf(tmp_template, sizeof(tmp_template), "%s/baseimg.XXXXXX", BASE_DIR) >= (int)sizeof(tmp_template)) { printf("path too long\n"); return; }
-        int fd = mkstemp(tmp_template);
-        if (fd < 0) { perror("mkstemp"); return; }
-        close(fd);
-
-        pid_t pid = fork();
-        if (pid < 0) { perror("fork"); unlink(tmp_template); return; }
-        if (pid == 0) {
-            execlp("curl", "curl", "-L", "--fail", "-o", tmp_template, url, (char *)NULL);
-            
-            execlp("wget", "wget", "-O", tmp_template, url, (char *)NULL);
-            
-            perror("exec(curl/wget)"); _exit(127);
-        }
-        
-        int status = 0;
-        if (waitpid(pid, &status, 0) < 0) { perror("waitpid"); unlink(tmp_template); return; }
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) { fprintf(stderr, "Download failed (code=%d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1); unlink(tmp_template); return; }
-
-        struct stat st;
-        if (stat(tmp_template, &st) != 0 || st.st_size == 0) { fprintf(stderr, "Downloaded file missing/empty\n"); unlink(tmp_template); return; }
-
- 
-if (access(VM_BASE_QCOW2, F_OK) == 0) {
-    if (unlink(VM_BASE_QCOW2) != 0) perror("unlink old base");
-}
-if (rename(tmp_template, VM_BASE_QCOW2) != 0) {
-    perror("rename base");
-    unlink(tmp_template);
-    return;
-}
-printf("Base image updated to %s\n", VM_BASE_QCOW2);
-
-}
-
 /* find a non-loopback IPv6/IPv4 address to advertise to users */
 void showServerIP(void) {
     struct ifaddrs *ifaddr, *ifa;
-    char found[INET6_ADDRSTRLEN] = "";
+    char found6[INET6_ADDRSTRLEN] = "";
+    char found4[INET_ADDRSTRLEN] = "";
 
     if (getifaddrs(&ifaddr) == -1) {
         printf("Server IP: ::1 (fallback)\n");
@@ -691,36 +667,47 @@ void showServerIP(void) {
 
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr) continue;
-        if (ifa->ifa_addr->sa_family == AF_INET6) {
+        if (ifa->ifa_addr->sa_family == AF_INET6 && !found6[0]) {
             struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
             if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) continue;
             if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) continue;
             char host[INET6_ADDRSTRLEN];
             if (inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host)) == NULL) continue;
-            strncpy(found, host, sizeof(found));
-            found[sizeof(found) - 1] = '\0';
-            break;
-        }
-    }
-
-    if (!found[0]) {
-        for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr) continue;
-            if (ifa->ifa_addr->sa_family == AF_INET) {
-                char host[INET_ADDRSTRLEN];
-                struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-                if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == NULL) continue;
-                if (strncmp(host, "127.", 4) == 0) continue;
-                strncpy(found, host, sizeof(found));
-                found[sizeof(found) - 1] = '\0';
-                break;
-            }
+            strncpy(found6, host, sizeof(found6));
+            found6[sizeof(found6) - 1] = '\0';
+        } else if (ifa->ifa_addr->sa_family == AF_INET && !found4[0]) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+            char host[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host)) == NULL) continue;
+            if (strncmp(host, "127.", 4) == 0) continue;
+            strncpy(found4, host, sizeof(found4));
+            found4[sizeof(found4) - 1] = '\0';
         }
     }
 
     freeifaddrs(ifaddr);
-    if (found[0]) printf("Server IP: %s\n", found);
-    else printf("Server IP: ::1 (fallback)\n");
+
+    if (g_cfg.ip_mode == IP_MODE_IPV4) {
+        if (found4[0]) {
+            printf("Server IP (ipv4): %s\n", found4);
+            return;
+        }
+        if (found6[0]) {
+            printf("Server IP (fallback ipv6): %s\n", found6);
+            return;
+        }
+        printf("Server IP: 127.0.0.1 (fallback)\n");
+    } else {
+        if (found6[0]) {
+            printf("Server IP (ipv6): %s\n", found6);
+            return;
+        }
+        if (found4[0]) {
+            printf("Server IP (fallback ipv4): %s\n", found4);
+            return;
+        }
+        printf("Server IP: ::1 (fallback)\n");
+    }
 }
  
 
@@ -809,14 +796,20 @@ void startVM(void) {
           
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
-                /* listen on all interfaces so SSH can be reached remotely; tighten firewall if needed */
-                char portarg[64]; snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:[::]:%d-:22", sshPort);
+                /* listen on configured IP family; hostfwd handles the bind */
+                char portarg[128];
+                if (g_cfg.ip_mode == IP_MODE_IPV4) {
+                    snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
+                } else {
+                    snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:[::]:%d-:22", sshPort);
+                }
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
                 char virtfs[PATH_MAX + 96]; snprintf(virtfs, sizeof(virtfs), "local,id=hostshare,path=%s,security_model=none,mount_tag=hostshare", accountDir);
                 char *const argv[] = {
                     "qemu-system-x86_64",
                     "-m", "512M",
                     "-nographic",
+                    "-device", "virtio-rng-pci", /* provide entropy so sshd banner is fast */
                     "-net", portarg,
                     "-net", "nic",
                     "-drive", drivearg,
@@ -893,7 +886,6 @@ void showHelp(void) {
     printf("startvm       - Start a VM\n");
     printf("stopvm        - Stop all VMs\n");
     printf("serverip      - Show server IP address\n");
-    printf("changeimg     - Download a new base QCOW2 from a URL (replace ./vm/base.qcow2)\n");
     printf("userinfo      - Show info about a user\n\n");
 }
 
@@ -917,7 +909,6 @@ void menu(void) {
         else if (!strcmp(input, "resetuser")) resetUser();
         else if (!strcmp(input, "rebuildbase")) rebuildBase();
         else if (!strcmp(input, "help")) showHelp();
-        else if (!strcmp(input, "changeimg")) changeimg();
         else if (!strcmp(input, "serverip")) showServerIP();
         else if (!strcmp(input, "exit")) {
             if (ask_yes_default_yes("Are you sure you want to exit? [Y/n]: ")) exit(0);
@@ -930,7 +921,7 @@ void menu(void) {
 
 /* entry point: ensure folders/base exist, then enter menu loop */
 int main(void) {
-    
+    loadConfig();
     if (ensureAccountsFolder() != 0) {
         fprintf(stderr, "Failed to create accounts directory\n");
         return 1;
@@ -939,4 +930,39 @@ int main(void) {
     menu();
     
     return 0;
+}
+
+/* Parse config.cfg for base_image_url and ip_mode. Missing file keeps defaults. */
+void loadConfig(void) {
+    /* reset defaults */
+    snprintf(g_cfg.base_image_url, sizeof(g_cfg.base_image_url), "%s", DEFAULT_BASE_IMAGE_URL);
+    g_cfg.ip_mode = IP_MODE_IPV6;
+
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (!f) return;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        trim_leading_ws(&p);
+        if (*p == '#' || *p == ';' || *p == '\0') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *val = eq + 1;
+        trim_trailing_ws(p);
+        trim_trailing_ws(val);
+        trim_leading_ws(&val);
+
+        if (strcasecmp(p, "base_image_url") == 0) {
+            if (*val) {
+                snprintf(g_cfg.base_image_url, sizeof(g_cfg.base_image_url), "%s", val);
+            }
+        } else if (strcasecmp(p, "ip_mode") == 0) {
+            if (strcasecmp(val, "ipv4") == 0) g_cfg.ip_mode = IP_MODE_IPV4;
+            else if (strcasecmp(val, "ipv6") == 0) g_cfg.ip_mode = IP_MODE_IPV6;
+        }
+    }
+
+    fclose(f);
 }
