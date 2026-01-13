@@ -17,8 +17,8 @@
 #include <unistd.h>
 
 #define BUF_SIZE 256
-#define DEFAULT_USER "cloud"
-#define BASE_PORT 2200
+#define DEFAULT_USER ""
+#define BASE_PORT 0
 #define CONNECT_TIMEOUT_SEC 2
 #define DEFAULT_CAMERA_DEV "/dev/video0"
 
@@ -429,8 +429,8 @@ int main(int argc, char **argv) {
     gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
     gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
 
-    GtkWidget *lbl_ip = gtk_label_new("Server-IP (IPv6)");
-    app.entry_ip = build_entry("z.B. 2001:db8::1", "");
+    GtkWidget *lbl_ip = gtk_label_new("Server-IP");
+    app.entry_ip = build_entry("", "");
     gtk_grid_attach(GTK_GRID(grid), lbl_ip, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), app.entry_ip, 1, 0, 2, 1);
 
@@ -442,7 +442,10 @@ int main(int argc, char **argv) {
     GtkWidget *lbl_port = gtk_label_new("SSH-Port");
     int default_port = compute_port_for_user(DEFAULT_USER);
     char port_buf[16];
-    snprintf(port_buf, sizeof(port_buf), "%d", default_port);
+    if (default_port > 0)
+        snprintf(port_buf, sizeof(port_buf), "%d", default_port);
+    else
+        port_buf[0] = '\0';
     app.entry_port = build_entry(NULL, port_buf);
     gtk_grid_attach(GTK_GRID(grid), lbl_port, 0, 2, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), app.entry_port, 1, 2, 2, 1);
@@ -452,7 +455,7 @@ int main(int argc, char **argv) {
     gtk_grid_attach(GTK_GRID(grid), app.check_camera, 0, 3, 3, 1);
 
     GtkWidget *lbl_cam_port = gtk_label_new("Kamera-Port");
-    app.entry_cam_port = build_entry("z.B. 9000", "");
+    app.entry_cam_port = build_entry("", "");
     gtk_grid_attach(GTK_GRID(grid), lbl_cam_port, 0, 4, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), app.entry_cam_port, 1, 4, 2, 1);
 
