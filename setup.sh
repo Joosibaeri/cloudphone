@@ -3,7 +3,7 @@ set -e
 
 BASE_DIR="/userdata/base"
 IMG_FILE="$BASE_DIR/base.qcow2"
-DEFAULT_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+DEFAULT_URL="https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
 
 usage() {
     cat <<EOF

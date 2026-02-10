@@ -40,7 +40,7 @@
 #define CAMERA_PORT_FILE "camera.port"
 #define CONFIG_PATH "./config.cfg"
 
-#define DEFAULT_BASE_IMAGE_URL "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+#define DEFAULT_BASE_IMAGE_URL "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
 #define DEFAULT_IP_MODE "ipv6"
 
 enum ip_mode { IP_MODE_IPV6 = 0, IP_MODE_IPV4 = 1 };
@@ -175,7 +175,7 @@ int selectAccount(char *accountName) {
 /*
  * Ensure a base qcow2 exists at VM_BASE_QCOW2.
  * - mkdir -p ./vm
- * - download the current Debian cloud image if missing
+ * - download the current cloud image if missing
  * - run provisioning once (stamp file prevents re-run)
  */
 int ensureBaseImage(void) {
@@ -183,7 +183,7 @@ int ensureBaseImage(void) {
 
     if (access(VM_BASE_QCOW2, F_OK) != 0) {
         char tmp[PATH_MAX];
-        snprintf(tmp, sizeof(tmp), "%s/debian-cloudimg.qcow2", BASE_DIR);
+        snprintf(tmp, sizeof(tmp), "%s/base-cloudimg.qcow2", BASE_DIR);
         fprintf(stderr, "Base qcow2 not found at %s. Attempting download...\n", VM_BASE_QCOW2);
         const char *url = g_cfg.base_image_url[0] ? g_cfg.base_image_url : DEFAULT_BASE_IMAGE_URL;
         char cmd[PATH_MAX * 2];
@@ -721,7 +721,13 @@ void showServerIP(void) {
  * - Write pid/log files to the account directory
  */
 void startVM(void) {
-    if (access("/usr/bin/qemu-system-x86_64", X_OK) != 0) {
+    const char *qemu_bin = NULL;
+    if (access("/usr/bin/qemu-system-x86_64", X_OK) == 0) {
+        qemu_bin = "/usr/bin/qemu-system-x86_64";
+    } else if (access("/usr/libexec/qemu-kvm", X_OK) == 0) {
+        qemu_bin = "/usr/libexec/qemu-kvm";
+    }
+    if (!qemu_bin) {
         fprintf(stderr, "QEMU is not installed or not in PATH\n");
         return;
     }
@@ -806,7 +812,7 @@ void startVM(void) {
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
                 char virtfs[PATH_MAX + 96]; snprintf(virtfs, sizeof(virtfs), "local,id=hostshare,path=%s,security_model=none,mount_tag=hostshare", accountDir);
                 char *const argv[] = {
-                    "qemu-system-x86_64",
+                    (char *)qemu_bin,
                     "-m", "512M",
                     "-nographic",
                     "-device", "virtio-rng-pci", /* provide entropy so sshd banner is fast */
@@ -816,7 +822,7 @@ void startVM(void) {
                     "-virtfs", virtfs,
                     NULL
                 };
-        execvp("qemu-system-x86_64", argv);
+        execv(qemu_bin, argv);
 
         
         int save_errno = errno;

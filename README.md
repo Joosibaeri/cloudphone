@@ -14,6 +14,11 @@ make         # builds `main` from main.c
 
 If you want the compatibility name used previously, `make cloudphone_server` will produce an executable named `cloudphone_server`.
 
+Rocky Linux
+------------
+- The default base image is now Rocky Linux 9 GenericCloud. You can change `base_image_url` in [config.cfg](config.cfg) to any other qcow2 cloud image.
+- Provisioning supports both `apt-get` and `dnf/yum` inside the guest image.
+
 CloudPhone is designed for controlled environments, keeping the client minimal while the server handles most of the logic and data management.
 
 IPv6
