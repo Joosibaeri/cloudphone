@@ -20,14 +20,48 @@ export LIBGUESTFS_BACKEND
 
 echo "Provisioning base image: $BASE_IMAGE"
 virt-customize -a "$BASE_IMAGE" \
-  --run-command 'set -e; if command -v apt-get >/dev/null 2>&1; then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server qemu-guest-agent curl ffmpeg netcat-openbsd v4l-utils; elif command -v dnf >/dev/null 2>&1; then dnf -y install epel-release || true; dnf -y install openssh-server qemu-guest-agent curl nmap-ncat v4l-utils || true; dnf -y install ffmpeg || true; elif command -v yum >/dev/null 2>&1; then yum -y install epel-release || true; yum -y install openssh-server qemu-guest-agent curl nmap-ncat v4l-utils || true; yum -y install ffmpeg || true; fi' \
+  --run-command 'set -e; if command -v apt-get >/dev/null 2>&1; then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server qemu-guest-agent curl ffmpeg netcat-openbsd v4l-utils; elif command -v dnf >/dev/null 2>&1; then dnf -y install epel-release || true; dnf -y install openssh-server qemu-guest-agent curl nmap-ncat v4l-utils NetworkManager dhcp-client || true; dnf -y install ffmpeg || true; elif command -v yum >/dev/null 2>&1; then yum -y install epel-release || true; yum -y install openssh-server qemu-guest-agent curl nmap-ncat v4l-utils NetworkManager dhcp-client || true; yum -y install ffmpeg || true; fi' \
   --run-command 'ssh-keygen -A' \
   --run-command 'id -u cloud >/dev/null 2>&1 || useradd -m -s /bin/bash cloud' \
   --run-command 'echo "cloud:cloud" | chpasswd' \
   --run-command 'sed -i "s/^#PasswordAuthentication yes/PasswordAuthentication yes/" /etc/ssh/sshd_config' \
-  --run-command 'printf "\nUseDNS no\nPrintMotd no\n" >> /etc/ssh/sshd_config' \
+  --run-command 'printf "\nUseDNS no\nPrintMotd no\nListenAddress 0.0.0.0\nListenAddress ::\n" >> /etc/ssh/sshd_config' \
   --run-command 'systemctl enable ssh || true' \
   --run-command 'systemctl enable sshd || true' \
+  --run-command 'systemctl enable NetworkManager || true' \
+  --write '/etc/systemd/system/cloudphone-dhcp.service:[Unit]
+Description=CloudPhone DHCP for eth0
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/dhclient -v -4 -6 eth0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+' \
+  --run-command 'systemctl enable cloudphone-dhcp.service || true' \
+  --run-command 'systemctl disable firewalld || true' \
+  --write '/etc/NetworkManager/system-connections/cloudphone-eth0.nmconnection:[connection]
+id=cloudphone-eth0
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+addr-gen-mode=stable-privacy
+
+[ethernet]
+
+[proxy]
+' \
+  --chmod '0600:/etc/NetworkManager/system-connections/cloudphone-eth0.nmconnection' \
   --run-command 'systemctl enable qemu-guest-agent || true' \
   --run-command 'mkdir -p /opt/cloudphone && echo provisioned > /opt/cloudphone/provisioned'
 echo "Provisioning completed."

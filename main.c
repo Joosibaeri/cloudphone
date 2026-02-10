@@ -34,6 +34,8 @@
 #define VM_LAUNCH_BIN "./vm/launch"             /* helper binary to copy */
 #define VM_PROVISIONER "./vm/provision_base.sh"  /* script that provisions base */
 #define SSH_PORT_FILE "ssh.port"
+#define SSH_V6_PID_FILE "sshv6.pid"
+#define SSH_V6_LOG_NAME "sshv6.log"
 #define CAMERA_OUT_NAME "camera.mjpg"
 #define CAMERA_LOG_NAME "cam.log"
 #define CAMERA_PID_NAME "cam.pid"
@@ -66,11 +68,13 @@ void cloneUser(void);
 void resetUser(void);
 void rebuildBase(void);
 pid_t startCameraBridge(const char *accountDir, int preferredStartPort, int *outPort);
+pid_t startIPv6Forward(const char *accountDir, int port);
 void startVM(void);
 void stopVM(void);
  
 int deployLaunchBinary(const char *accountDir);
 void stopCameraBridge(const char *accountDir);
+void stopIPv6Forward(const char *accountDir);
 
 /* helpers */
 int findFreePortFrom(int startPort);
@@ -476,6 +480,57 @@ void stopCameraBridge(const char *accountDir) {
     unlink(portfile);
 }
 
+/* start IPv6 -> IPv4 SSH forwarder using socat (per-account) */
+pid_t startIPv6Forward(const char *accountDir, int port) {
+    if (g_cfg.ip_mode != IP_MODE_IPV6) return 0;
+    char pidp[PATH_MAX], logp[PATH_MAX];
+    if (snprintf(pidp, sizeof(pidp), "%s/%s", accountDir, SSH_V6_PID_FILE) >= (int)sizeof(pidp)) return -1;
+    if (snprintf(logp, sizeof(logp), "%s/%s", accountDir, SSH_V6_LOG_NAME) >= (int)sizeof(logp)) return -1;
+
+    pid_t existing = pidfile_read(pidp);
+    if (existing && process_is_running(existing)) return existing;
+    unlink(pidp);
+
+    const char *socat_bin = NULL;
+    if (access("/usr/bin/socat", X_OK) == 0) socat_bin = "/usr/bin/socat";
+    else if (access("/usr/sbin/socat", X_OK) == 0) socat_bin = "/usr/sbin/socat";
+    if (!socat_bin) {
+        fprintf(stderr, "Warning: socat not found; IPv6 SSH forward not started\n");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        int fd = open(logp, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
+
+        char lspec[128];
+        char rspec[128];
+        snprintf(lspec, sizeof(lspec), "TCP6-LISTEN:%d,bind=[::],fork,reuseaddr,ipv6only=1", port);
+        snprintf(rspec, sizeof(rspec), "TCP4:127.0.0.1:%d", port);
+
+        char *const argv[] = { (char *)socat_bin, lspec, rspec, NULL };
+        execv(socat_bin, argv);
+        _exit(127);
+    }
+
+    FILE *f = fopen(pidp, "w");
+    if (f) { fprintf(f, "%d\n", (int)pid); fclose(f); }
+    return pid;
+}
+
+/* stop IPv6 forwarder if running */
+void stopIPv6Forward(const char *accountDir) {
+    char pidp[PATH_MAX];
+    if (snprintf(pidp, sizeof(pidp), "%s/%s", accountDir, SSH_V6_PID_FILE) >= (int)sizeof(pidp)) return;
+    pid_t pid = pidfile_read(pidp);
+    if (pid && process_is_running(pid)) {
+        kill(pid, SIGTERM);
+    }
+    unlink(pidp);
+}
+
  
 /* bind-scan for a free TCP port on all interfaces starting at startPort */
 int findFreePortFrom(int startPort) {
@@ -803,23 +858,23 @@ void startVM(void) {
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
                 /* listen on configured IP family; hostfwd handles the bind */
-                char portarg[128];
+                char netdevarg[192];
                 if (g_cfg.ip_mode == IP_MODE_IPV4) {
-                    snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
+                    snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
                 } else {
-                    snprintf(portarg, sizeof(portarg), "user,hostfwd=tcp:[::]:%d-:22", sshPort);
+                    /* IPv6 hostfwd without brackets in QEMU user networking */
+                    snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,ipv6=on,hostfwd=tcp::%d-:22", sshPort);
                 }
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
-                char virtfs[PATH_MAX + 96]; snprintf(virtfs, sizeof(virtfs), "local,id=hostshare,path=%s,security_model=none,mount_tag=hostshare", accountDir);
                 char *const argv[] = {
                     (char *)qemu_bin,
                     "-m", "512M",
+                    "-cpu", "host",
                     "-nographic",
                     "-device", "virtio-rng-pci", /* provide entropy so sshd banner is fast */
-                    "-net", portarg,
-                    "-net", "nic",
+                    "-netdev", netdevarg,
+                    "-device", "virtio-net-pci,netdev=net0",
                     "-drive", drivearg,
-                    "-virtfs", virtfs,
                     NULL
                 };
         execv(qemu_bin, argv);
@@ -839,6 +894,12 @@ void startVM(void) {
     if (r == 0) {
         FILE *f = fopen(userPid, "w"); if (f) { fprintf(f, "%d\n", pid); fclose(f); }
         int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
+        if (g_cfg.ip_mode == IP_MODE_IPV6) {
+            pid_t v6pid = startIPv6Forward(accountDir, sshPort);
+            if (v6pid <= 0) {
+                fprintf(stderr, "Warning: IPv6 SSH forward not started for '%s'\n", accountName);
+            }
+        }
         if (cameraPort > 0) {
             printf("VM started: ssh=%d camera=%d pid=%d disk=%s log=%s pidfile=%s (cam pid may be %d)\n", sshPort, cameraPort, pid, diskPath, userLog, userPid, (int)camPid);
         } else {
@@ -867,11 +928,13 @@ void stopVM(void) {
     if (!process_is_running(pid)) {
         printf("Stale pidfile found (pid=%d). Removing pidfile.\n", (int)pid);
         if (unlink(userPid) != 0) perror("unlink pidfile");
+        stopIPv6Forward(accountDir);
         stopCameraBridge(accountDir);
         return;
     }
     if (kill((pid_t)pid, SIGTERM) != 0) { perror("kill"); return; }
     if (unlink(userPid) != 0) perror("unlink pidfile");
+    stopIPv6Forward(accountDir);
     stopCameraBridge(accountDir);
     printf("Sent SIGTERM to pid %d for account '%s' and stopped camera bridge\n", (int)pid, accountName);
 }
