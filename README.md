@@ -23,5 +23,5 @@ CloudPhone is designed for controlled environments, keeping the client minimal w
 
 IPv6
 -----
-- Host-side forwarding now binds to IPv6 loopback (`[::1]`) for SSH access to the guest; choose your host port from the startup log and connect with `ssh -6 -p <port> cloud@::1` (or the printed IPv6 address if reachable externally).
-- Dynamic port allocation and helper processes use IPv6-only bindings; ensure clients reach the server via IPv6.
+- In `ipv6` mode, the VM still forwards SSH on IPv4 (e.g., `ssh -p <port> cloud@127.0.0.1`) and a socat helper bridges IPv6 connections to the same port. Use `ssh -6 -p <port> cloud@::1` for local IPv6.
+- Dynamic port allocation still uses IPv6-only bindings for the helper forwarder; ensure IPv6 clients can reach the server address printed by `serverip`.

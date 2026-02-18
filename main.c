@@ -857,14 +857,9 @@ void startVM(void) {
           
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
-                /* listen on configured IP family; hostfwd handles the bind */
+                /* always bind SSH forward on IPv4; IPv6 mode uses socat to bridge */
                 char netdevarg[192];
-                if (g_cfg.ip_mode == IP_MODE_IPV4) {
-                    snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
-                } else {
-                    /* IPv6 hostfwd without brackets in QEMU user networking */
-                    snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,ipv6=on,hostfwd=tcp::%d-:22", sshPort);
-                }
+                snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,ipv6=on,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
                 char *const argv[] = {
                     (char *)qemu_bin,

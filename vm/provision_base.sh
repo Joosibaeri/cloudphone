@@ -5,6 +5,11 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BASE_IMAGE=${1:-"${SCRIPT_DIR}/base.qcow2"}
 
 if [[ ! -f "$BASE_IMAGE" ]]; then
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+BASE_IMAGE=${1:-"${SCRIPT_DIR}/base.qcow2"}
+
+if [[ ! -f "$BASE_IMAGE" ]]; then
   echo "Base image not found: $BASE_IMAGE" >&2
   exit 1
 fi
@@ -36,7 +41,7 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/dhclient -v -4 -6 eth0
+ExecStart=/usr/bin/env dhclient -v -4 -6 eth0
 RemainAfterExit=yes
 
 [Install]
@@ -53,7 +58,7 @@ autoconnect=true
 [ipv4]
 method=auto
 
-[ipv6]
+[ipv6]cd "$(dirname "$0")" && pwd
 method=auto
 addr-gen-mode=stable-privacy
 
