@@ -5,11 +5,6 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BASE_IMAGE=${1:-"${SCRIPT_DIR}/base.qcow2"}
 
 if [[ ! -f "$BASE_IMAGE" ]]; then
-
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-BASE_IMAGE=${1:-"${SCRIPT_DIR}/base.qcow2"}
-
-if [[ ! -f "$BASE_IMAGE" ]]; then
   echo "Base image not found: $BASE_IMAGE" >&2
   exit 1
 fi
@@ -58,7 +53,7 @@ autoconnect=true
 [ipv4]
 method=auto
 
-[ipv6]cd "$(dirname "$0")" && pwd
+[ipv6]
 method=auto
 addr-gen-mode=stable-privacy
 

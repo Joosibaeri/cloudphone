@@ -15,9 +15,14 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <netdb.h>
+#include <sys/select.h>
+#include <sys/un.h>
+#include <net/if.h>
 #include <ifaddrs.h>
 #include <ctype.h>
 #include <strings.h>
+#include <stdint.h>
+#include <time.h>
 
 /*
  * Small CLI to manage per-user QEMU VMs and their camera bridge.
@@ -44,15 +49,20 @@
 
 #define DEFAULT_BASE_IMAGE_URL "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
 #define DEFAULT_IP_MODE "ipv6"
+#define DEFAULT_NETWORK_MODE "bridge"
+#define DEFAULT_BRIDGE_NAME "br0"
 
 enum ip_mode { IP_MODE_IPV6 = 0, IP_MODE_IPV4 = 1 };
+enum network_mode { NET_MODE_USER = 0, NET_MODE_BRIDGE = 1 };
 
 struct Config {
     char base_image_url[PATH_MAX];
     enum ip_mode ip_mode;
+    enum network_mode network_mode;
+    char bridge_name[128];
 };
 
-static struct Config g_cfg = { DEFAULT_BASE_IMAGE_URL, IP_MODE_IPV6 };
+static struct Config g_cfg = { DEFAULT_BASE_IMAGE_URL, IP_MODE_IPV6, NET_MODE_BRIDGE, DEFAULT_BRIDGE_NAME };
 
 /* core commands */
 int selectAccount(char *accountName);
@@ -78,6 +88,14 @@ void stopIPv6Forward(const char *accountDir);
 
 /* helpers */
 int findFreePortFrom(int startPort);
+int fetchPublicIPIfconfigMe(char *out, size_t outSize);
+int buildVmMacForAccount(const char *accountName, char *out, size_t outSize);
+int findVmIpByMacOnBridge(const char *bridgeName, const char *mac, char *outIp, size_t outIpSize, int retries, int delayMs);
+int findVmIpViaQga(const char *qgaSockPath, char *outIp, size_t outIpSize, int retries, int delayMs);
+static void primeBridgeNeighborTable(const char *bridgeName);
+static int bridge_exists(const char *bridgeName);
+static int qemu_bridge_allowed(const char *bridgeName);
+static int find_first_bridge(char *out, size_t outSize);
  
 void showHelp(void);
 void menu(void);
@@ -101,6 +119,7 @@ static pid_t pidfile_read(const char *path);
 static int process_is_running(pid_t pid);
 static void trim_trailing_ws(char *s);
 static void trim_leading_ws(char **p);
+static void sleep_ms(int ms);
 
 /* recursively create a directory path (mkdir -p behavior) */
 static int ensure_dir(const char *path) {
@@ -137,6 +156,16 @@ static void trim_trailing_ws(char *s) {
 static void trim_leading_ws(char **p) {
     if (!p || !*p) return;
     while (**p && isspace((unsigned char)**p)) (*p)++;
+}
+
+/* sleep helper in milliseconds (POSIX-safe with nanosleep) */
+static void sleep_ms(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
 }
 
 /* read pid from a pidfile; returns 0 on error */
@@ -557,6 +586,398 @@ int findFreePortFrom(int startPort) {
     close(s);
     return -1;
 }
+
+/* fetch public IP via plain HTTP from ifconfig.me/ip */
+int fetchPublicIPIfconfigMe(char *out, size_t outSize) {
+    if (!out || outSize < 8) return -1;
+    out[0] = '\0';
+
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo("ifconfig.me", "80", &hints, &res) != 0) return -1;
+
+    int sock = -1;
+    for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0) continue;
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(sock);
+        sock = -1;
+    }
+    freeaddrinfo(res);
+    if (sock < 0) return -1;
+
+    const char *req =
+        "GET /ip HTTP/1.1\r\n"
+        "Host: ifconfig.me\r\n"
+        "User-Agent: cloudphone-server\r\n"
+        "Connection: close\r\n\r\n";
+    size_t reqLen = strlen(req);
+    if (send(sock, req, reqLen, 0) != (ssize_t)reqLen) {
+        close(sock);
+        return -1;
+    }
+
+    char buf[4096];
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = recv(sock, buf + total, sizeof(buf) - 1 - total, 0);
+        if (n < 0) {
+            close(sock);
+            return -1;
+        }
+        if (n == 0) break;
+        total += (size_t)n;
+        if (total >= sizeof(buf) - 1) break;
+    }
+    close(sock);
+    buf[total] = '\0';
+
+    char *body = strstr(buf, "\r\n\r\n");
+    if (!body) return -1;
+    body += 4;
+
+    while (*body && isspace((unsigned char)*body)) body++;
+    size_t len = strcspn(body, "\r\n");
+    while (len > 0 && isspace((unsigned char)body[len - 1])) len--;
+    if (len == 0 || len >= outSize) return -1;
+
+    memcpy(out, body, len);
+    out[len] = '\0';
+    return 0;
+}
+
+/* build stable QEMU MAC from account name: 52:54:00:xx:xx:xx */
+int buildVmMacForAccount(const char *accountName, char *out, size_t outSize) {
+    if (!accountName || !*accountName || !out || outSize < 18) return -1;
+    uint32_t hash = 2166136261u; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)accountName; *p; ++p) {
+        hash ^= (uint32_t)(*p);
+        hash *= 16777619u;
+    }
+    int n = snprintf(
+        out,
+        outSize,
+        "52:54:00:%02x:%02x:%02x",
+        (unsigned int)((hash >> 16) & 0xff),
+        (unsigned int)((hash >> 8) & 0xff),
+        (unsigned int)(hash & 0xff)
+    );
+    return (n > 0 && (size_t)n < outSize) ? 0 : -1;
+}
+
+static int valid_ifname(const char *s) {
+    if (!s || !*s) return 0;
+    size_t len = strlen(s);
+    if (len >= 64) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == '.')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int bridge_exists(const char *bridgeName) {
+    if (!valid_ifname(bridgeName)) return 0;
+    return if_nametoindex(bridgeName) != 0;
+}
+
+static int qemu_bridge_allowed(const char *bridgeName) {
+    if (!valid_ifname(bridgeName)) return 0;
+    FILE *f = fopen("/etc/qemu/bridge.conf", "r");
+    if (!f) return 0;
+    char line[256];
+    int allowed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        trim_leading_ws(&p);
+        trim_trailing_ws(p);
+        if (*p == '\0' || *p == '#') continue;
+        if (strncasecmp(p, "allow", 5) != 0) continue;
+        p += 5;
+        trim_leading_ws(&p);
+        if (strcasecmp(p, "all") == 0 || strcmp(p, bridgeName) == 0) {
+            allowed = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return allowed;
+}
+
+static int find_first_bridge(char *out, size_t outSize) {
+    if (!out || outSize < 2) return -1;
+    out[0] = '\0';
+
+    DIR *d = opendir("/sys/class/net");
+    if (!d) return -1;
+
+    struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!valid_ifname(entry->d_name)) continue;
+
+        char marker[PATH_MAX];
+        if (snprintf(marker, sizeof(marker), "/sys/class/net/%s/bridge", entry->d_name) >= (int)sizeof(marker)) continue;
+        if (access(marker, F_OK) == 0) {
+            int n = snprintf(out, outSize, "%s", entry->d_name);
+            closedir(d);
+            return (n > 0 && (size_t)n < outSize) ? 0 : -1;
+        }
+    }
+    closedir(d);
+    return -1;
+}
+
+static int probe_ipv4_host_port(const char *ip, int port, int timeoutMs) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) {
+        close(fd);
+        return 0;
+    }
+    if (errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    (void)select(fd + 1, NULL, &wfds, NULL, &tv);
+    close(fd);
+    return 0;
+}
+
+static void primeBridgeNeighborTable(const char *bridgeName) {
+    if (!valid_ifname(bridgeName)) return;
+
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) return;
+
+    uint32_t host = 0;
+    uint32_t mask = 0;
+    int found = 0;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_netmask) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!ifa->ifa_name || strcmp(ifa->ifa_name, bridgeName) != 0) continue;
+
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        struct sockaddr_in *msk = (struct sockaddr_in *)ifa->ifa_netmask;
+        host = ntohl(sin->sin_addr.s_addr);
+        mask = ntohl(msk->sin_addr.s_addr);
+        found = 1;
+        break;
+    }
+    freeifaddrs(ifaddr);
+    if (!found) return;
+
+    uint32_t network = host & mask;
+    uint32_t broadcast = network | (~mask);
+    if (broadcast <= network + 1) return;
+
+    uint32_t hostCount = broadcast - network - 1;
+    if (hostCount == 0 || hostCount > 1024) return;
+
+    char ipbuf[32];
+    for (uint32_t ip = network + 1; ip < broadcast; ++ip) {
+        if (ip == host) continue;
+        struct in_addr ia;
+        ia.s_addr = htonl(ip);
+        if (!inet_ntop(AF_INET, &ia, ipbuf, sizeof(ipbuf))) continue;
+        (void)probe_ipv4_host_port(ipbuf, 22, 20);
+    }
+}
+
+static int extract_non_loopback_ipv4(const char *text, char *outIp, size_t outIpSize) {
+    if (!text || !outIp || outIpSize < 16) return -1;
+    const char *p = text;
+    while (*p) {
+        if (!isdigit((unsigned char)*p)) { p++; continue; }
+
+        unsigned int a, b, c, d;
+        int consumed = 0;
+        if (sscanf(p, "%3u.%3u.%3u.%3u%n", &a, &b, &c, &d, &consumed) == 4) {
+            if (a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+                if (a != 127 && !(a == 169 && b == 254)) {
+                    int n = snprintf(outIp, outIpSize, "%u.%u.%u.%u", a, b, c, d);
+                    if (n > 0 && (size_t)n < outIpSize) return 0;
+                    return -1;
+                }
+            }
+            p += (consumed > 0 ? consumed : 1);
+            continue;
+        }
+        p++;
+    }
+    return -1;
+}
+
+static ssize_t recv_once_with_timeout(int fd, char *buf, size_t cap, int timeoutMs) {
+    if (!buf || cap == 0) return -1;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    int s = select(fd + 1, &rfds, NULL, NULL, &tv);
+    if (s <= 0) return -1;
+    return recv(fd, buf, cap, 0);
+}
+
+int findVmIpViaQga(const char *qgaSockPath, char *outIp, size_t outIpSize, int retries, int delayMs) {
+    if (!qgaSockPath || !*qgaSockPath || !outIp || outIpSize < 16) return -1;
+    outIp[0] = '\0';
+    if (retries < 1) retries = 1;
+    if (delayMs < 100) delayMs = 100;
+
+    const char *cmd = "{\"execute\":\"guest-network-get-interfaces\"}\n";
+
+    for (int attempt = 0; attempt < retries; ++attempt) {
+        if (access(qgaSockPath, F_OK) != 0) {
+            if (attempt + 1 < retries) sleep_ms(delayMs);
+            continue;
+        }
+
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            if (attempt + 1 < retries) sleep_ms(delayMs);
+            continue;
+        }
+
+        struct sockaddr_un sun;
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        if (snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", qgaSockPath) >= (int)sizeof(sun.sun_path)) {
+            close(fd);
+            return -1;
+        }
+
+        if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) != 0) {
+            close(fd);
+            if (attempt + 1 < retries) sleep_ms(delayMs);
+            continue;
+        }
+
+        char scratch[1024];
+        (void)recv_once_with_timeout(fd, scratch, sizeof(scratch), 100);
+
+        size_t cmdLen = strlen(cmd);
+        if (send(fd, cmd, cmdLen, 0) != (ssize_t)cmdLen) {
+            close(fd);
+            if (attempt + 1 < retries) sleep_ms(delayMs);
+            continue;
+        }
+
+        char resp[16384];
+        size_t total = 0;
+        for (int i = 0; i < 8 && total < sizeof(resp) - 1; ++i) {
+            ssize_t n = recv_once_with_timeout(fd, resp + total, sizeof(resp) - 1 - total, 700);
+            if (n <= 0) break;
+            total += (size_t)n;
+            if (strstr(resp, "\"return\"") && strchr(resp, ']')) break;
+        }
+        close(fd);
+        resp[total] = '\0';
+
+        if (total > 0 && extract_non_loopback_ipv4(resp, outIp, outIpSize) == 0) {
+            return 0;
+        }
+
+        if (attempt + 1 < retries) sleep_ms(delayMs);
+    }
+
+    return -1;
+}
+
+/* try to resolve VM IP (IPv4 preferred, then IPv6) by MAC using neighbor table */
+int findVmIpByMacOnBridge(const char *bridgeName, const char *mac, char *outIp, size_t outIpSize, int retries, int delayMs) {
+    if (!bridgeName || !mac || !outIp || outIpSize < 8) return -1;
+    if (!valid_ifname(bridgeName)) return -1;
+    outIp[0] = '\0';
+    if (retries < 1) retries = 1;
+    if (delayMs < 50) delayMs = 50;
+
+    char cmd4dev[256];
+    char cmd4all[256];
+    char cmd6dev[256];
+    int c1 = snprintf(cmd4dev, sizeof(cmd4dev), "ip -4 neigh show dev %s 2>/dev/null", bridgeName);
+    int c2 = snprintf(cmd4all, sizeof(cmd4all), "ip -4 neigh show 2>/dev/null");
+    int c3 = snprintf(cmd6dev, sizeof(cmd6dev), "ip -6 neigh show dev %s 2>/dev/null", bridgeName);
+    if (c1 <= 0 || c1 >= (int)sizeof(cmd4dev)) return -1;
+    if (c2 <= 0 || c2 >= (int)sizeof(cmd4all)) return -1;
+    if (c3 <= 0 || c3 >= (int)sizeof(cmd6dev)) return -1;
+
+    for (int attempt = 0; attempt < retries; ++attempt) {
+        const char *commands[] = { cmd4dev, cmd4all, cmd6dev };
+        for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+            FILE *fp = popen(commands[i], "r");
+            if (!fp) continue;
+
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                char ip[96] = {0};
+                char dev[64] = {0};
+                char lladdr[64] = {0};
+                int m = sscanf(line, "%95s dev %63s lladdr %63s", ip, dev, lladdr);
+                if (m >= 3 && strcasecmp(lladdr, mac) == 0) {
+                    size_t len = strlen(ip);
+                    if (len == 0) continue;
+
+                    if (strchr(ip, ':') != NULL) {
+                        if (strncasecmp(ip, "fe80", 4) == 0) {
+                            int n = snprintf(outIp, outIpSize, "%s%%%s", ip, bridgeName);
+                            if (n > 0 && (size_t)n < outIpSize) {
+                                pclose(fp);
+                                return 0;
+                            }
+                        } else if (len < outIpSize) {
+                            memcpy(outIp, ip, len + 1);
+                            pclose(fp);
+                            return 0;
+                        }
+                    } else {
+                        if (len < outIpSize) {
+                            memcpy(outIp, ip, len + 1);
+                            pclose(fp);
+                            return 0;
+                        }
+                    }
+                }
+            }
+            pclose(fp);
+        }
+        if (attempt == 2) {
+            primeBridgeNeighborTable(bridgeName);
+        }
+        if (attempt + 1 < retries) sleep_ms(delayMs);
+    }
+    return -1;
+}
 /*
  * Create a new account directory with a fresh disk copy and helper binary.
  * The launch helper is copied so per-account processes can run locally.
@@ -647,8 +1068,7 @@ void userInfo(void) {
         (void)read_int_file(sshportpath, &port);
     }
     if (port <= 0) {
-        port = 2200;
-        for (int i = 0; name[i]; i++) port += (unsigned char)name[i];
+        port = 22;
     }
     printf("User: %s\nDisk: %s\nSSH Port: %d\nDisk exists: %s\n", name, disk, port, access(disk, F_OK) == 0 ? "yes" : "no");
 }
@@ -807,6 +1227,12 @@ void startVM(void) {
     char accountDir[PATH_MAX * 2]; if (snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName) >= (int)sizeof(accountDir)) { printf("Internal path too long\n"); return; }
     char userLog[PATH_MAX * 2]; if (snprintf(userLog, sizeof(userLog), "%s/vm.log", accountDir) >= (int)sizeof(userLog)) { printf("Internal path too long\n"); return; }
     char userPid[PATH_MAX * 2]; if (snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir) >= (int)sizeof(userPid)) { printf("Internal path too long\n"); return; }
+    char qgaSockPath[PATH_MAX];
+    if (snprintf(qgaSockPath, sizeof(qgaSockPath), "%s/%s/qga.sock", ACCOUNTS_DIR, accountName) >= (int)sizeof(qgaSockPath)) {
+        printf("Internal path too long\n");
+        return;
+    }
+    unlink(qgaSockPath);
 
     if (access(diskPath, F_OK) != 0) {
         printf("Account '%s' disk.qcow2 not found. Copying base image...\n", accountName);
@@ -821,16 +1247,34 @@ void startVM(void) {
     char sshportpath[PATH_MAX];
     if (snprintf(sshportpath, sizeof(sshportpath), "%s/%s", accountDir, SSH_PORT_FILE) >= (int)sizeof(sshportpath)) { printf("Internal path too long\n"); return; }
 
-    int storedPort = -1;
-    (void)read_int_file(sshportpath, &storedPort);
+    sshPort = 22;
 
-    if (storedPort > 0) {
-        sshPort = findFreePortFrom(storedPort);
-    } else {
-        sshPort = findFreePortFrom(2200);
+    char activeBridge[128];
+    activeBridge[0] = '\0';
+    if (g_cfg.network_mode == NET_MODE_BRIDGE) {
+        if (bridge_exists(g_cfg.bridge_name)) {
+            snprintf(activeBridge, sizeof(activeBridge), "%s", g_cfg.bridge_name);
+        } else if (find_first_bridge(activeBridge, sizeof(activeBridge)) == 0) {
+            fprintf(stderr, "Configured bridge '%s' not found. Using detected bridge '%s'.\n", g_cfg.bridge_name, activeBridge);
+        } else {
+            fprintf(stderr, "Bridge mode requested but no Linux bridge interface found.\n");
+            fprintf(stderr, "Create a bridge (e.g. br0) or set network_mode=user in config.cfg.\n");
+            return;
+        }
+
+        if (!qemu_bridge_allowed(activeBridge)) {
+            fprintf(stderr, "QEMU bridge helper is not allowed to use '%s'.\n", activeBridge);
+            fprintf(stderr, "Add 'allow %s' to /etc/qemu/bridge.conf (or 'allow all').\n", activeBridge);
+            return;
+        }
     }
 
-    if (sshPort <= 0) { printf("No free ports available for SSH\n"); return; }
+    char vmMac[32];
+    if (buildVmMacForAccount(accountName, vmMac, sizeof(vmMac)) != 0) {
+        fprintf(stderr, "Failed to build VM MAC for account '%s'\n", accountName);
+        return;
+    }
+
     if (write_int_file(sshportpath, sshPort) != 0) {
         fprintf(stderr, "Warning: could not persist ssh port to %s\n", sshportpath);
     }
@@ -857,10 +1301,19 @@ void startVM(void) {
           
           int nullfd = open("/dev/null", O_RDONLY);
           if (nullfd >= 0) { dup2(nullfd, STDIN_FILENO); if (nullfd != STDIN_FILENO) close(nullfd); }
-                /* always bind SSH forward on IPv4; IPv6 mode uses socat to bridge */
-                char netdevarg[192];
-                snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,ipv6=on,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
+                char netdevarg[256];
+                char devicearg[256];
+                if (g_cfg.network_mode == NET_MODE_BRIDGE) {
+                    snprintf(netdevarg, sizeof(netdevarg), "bridge,id=net0,br=%s", activeBridge);
+                } else {
+                    snprintf(netdevarg, sizeof(netdevarg), "user,id=net0,ipv6=on,hostfwd=tcp:0.0.0.0:%d-:22", sshPort);
+                }
+                snprintf(devicearg, sizeof(devicearg), "virtio-net-pci,netdev=net0,mac=%s", vmMac);
                 char drivearg[PATH_MAX + 64]; snprintf(drivearg, sizeof(drivearg), "file=%s,format=qcow2,if=virtio", diskPath);
+                char qgaCharDevArg[PATH_MAX + 128];
+                if (snprintf(qgaCharDevArg, sizeof(qgaCharDevArg), "socket,id=qga0,path=%s,server=on,wait=off", qgaSockPath) >= (int)sizeof(qgaCharDevArg)) {
+                    _exit(127);
+                }
                 char *const argv[] = {
                     (char *)qemu_bin,
                     "-m", "512M",
@@ -868,7 +1321,10 @@ void startVM(void) {
                     "-nographic",
                     "-device", "virtio-rng-pci", /* provide entropy so sshd banner is fast */
                     "-netdev", netdevarg,
-                    "-device", "virtio-net-pci,netdev=net0",
+                    "-device", devicearg,
+                    "-chardev", qgaCharDevArg,
+                    "-device", "virtio-serial-pci",
+                    "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
                     "-drive", drivearg,
                     NULL
                 };
@@ -887,18 +1343,45 @@ void startVM(void) {
     close(pw[0]);
 
     if (r == 0) {
+        sleep_ms(700);
+        int quick_status = 0;
+        pid_t quick = waitpid(pid, &quick_status, WNOHANG);
+        if (quick == pid) {
+            fprintf(stderr, "QEMU exited shortly after start. Check log: %s\n", userLog);
+            return;
+        }
+
         FILE *f = fopen(userPid, "w"); if (f) { fprintf(f, "%d\n", pid); fclose(f); }
         int fd = open(userLog, O_CREAT | O_WRONLY | O_APPEND, 0644); if (fd >= 0) close(fd);
-        if (g_cfg.ip_mode == IP_MODE_IPV6) {
-            pid_t v6pid = startIPv6Forward(accountDir, sshPort);
-            if (v6pid <= 0) {
-                fprintf(stderr, "Warning: IPv6 SSH forward not started for '%s'\n", accountName);
-            }
-        }
         if (cameraPort > 0) {
             printf("VM started: ssh=%d camera=%d pid=%d disk=%s log=%s pidfile=%s (cam pid may be %d)\n", sshPort, cameraPort, pid, diskPath, userLog, userPid, (int)camPid);
         } else {
             printf("VM started: ssh=%d pid=%d disk=%s log=%s pidfile=%s\n", sshPort, pid, diskPath, userLog, userPid);
+        }
+        if (g_cfg.network_mode == NET_MODE_BRIDGE) {
+            char vmIp[64];
+            printf("Network mode: bridge (%s)\n", activeBridge);
+            printf("Each VM gets its own IP from your network DHCP.\n");
+            printf("VM MAC: %s\n", vmMac);
+            if (findVmIpViaQga(qgaSockPath, vmIp, sizeof(vmIp), 45, 1000) == 0 ||
+                findVmIpByMacOnBridge(activeBridge, vmMac, vmIp, sizeof(vmIp), 30, 1000) == 0) {
+                printf("VM IP: %s\n", vmIp);
+                printf("SSH connect: ssh cloud@%s\n", vmIp);
+            } else {
+                printf("VM IP: unresolved (guest agent/neighbor not ready yet)\n");
+                printf("SSH connect: ssh cloud@<vm-ip> (port 22)\n");
+            }
+        } else {
+            char publicIp[128];
+            if (fetchPublicIPIfconfigMe(publicIp, sizeof(publicIp)) == 0) {
+                printf("VM SSH via QEMU hostfwd is active on port %d\n", sshPort);
+                printf("Public IP (ifconfig.me): %s\n", publicIp);
+                printf("SSH connect: ssh -p %d cloud@%s\n", sshPort, publicIp);
+            } else {
+                printf("VM SSH via QEMU hostfwd is active on port %d\n", sshPort);
+                printf("Public IP (ifconfig.me): unavailable\n");
+                printf("SSH connect (local): ssh -p %d cloud@127.0.0.1\n", sshPort);
+            }
         }
     } else if (r > 0) {
         int status = 0; waitpid(pid, &status, 0);
@@ -916,8 +1399,16 @@ void startVM(void) {
 void stopVM(void) {
     char accountName[128];
     if (!selectAccount(accountName)) return;
-    char accountDir[PATH_MAX]; snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName);
-    char userPid[PATH_MAX]; snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir);
+    char accountDir[PATH_MAX * 2];
+    if (snprintf(accountDir, sizeof(accountDir), "%s/%s", ACCOUNTS_DIR, accountName) >= (int)sizeof(accountDir)) {
+        printf("Internal path too long\n");
+        return;
+    }
+    char userPid[PATH_MAX * 2];
+    if (snprintf(userPid, sizeof(userPid), "%s/vm.pid", accountDir) >= (int)sizeof(userPid)) {
+        printf("Internal path too long\n");
+        return;
+    }
     pid_t pid = pidfile_read(userPid);
     if (!pid) { printf("No pidfile found for '%s'. Is the VM running?\n", accountName); return; }
     if (!process_is_running(pid)) {
@@ -1001,6 +1492,8 @@ void loadConfig(void) {
     /* reset defaults */
     snprintf(g_cfg.base_image_url, sizeof(g_cfg.base_image_url), "%s", DEFAULT_BASE_IMAGE_URL);
     g_cfg.ip_mode = IP_MODE_IPV6;
+    g_cfg.network_mode = NET_MODE_BRIDGE;
+    snprintf(g_cfg.bridge_name, sizeof(g_cfg.bridge_name), "%s", DEFAULT_BRIDGE_NAME);
 
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return;
@@ -1025,6 +1518,13 @@ void loadConfig(void) {
         } else if (strcasecmp(p, "ip_mode") == 0) {
             if (strcasecmp(val, "ipv4") == 0) g_cfg.ip_mode = IP_MODE_IPV4;
             else if (strcasecmp(val, "ipv6") == 0) g_cfg.ip_mode = IP_MODE_IPV6;
+        } else if (strcasecmp(p, "network_mode") == 0) {
+            if (strcasecmp(val, "bridge") == 0) g_cfg.network_mode = NET_MODE_BRIDGE;
+            else if (strcasecmp(val, "user") == 0) g_cfg.network_mode = NET_MODE_USER;
+        } else if (strcasecmp(p, "bridge_name") == 0) {
+            if (*val) {
+                snprintf(g_cfg.bridge_name, sizeof(g_cfg.bridge_name), "%s", val);
+            }
         }
     }
 
