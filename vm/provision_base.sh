@@ -29,20 +29,13 @@ virt-customize -a "$BASE_IMAGE" \
   --run-command 'systemctl enable ssh || true' \
   --run-command 'systemctl enable sshd || true' \
   --run-command 'systemctl enable NetworkManager || true' \
-  --write '/etc/systemd/system/cloudphone-dhcp.service:[Unit]
-Description=CloudPhone DHCP for eth0
-After=network-pre.target
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/env dhclient -v -4 -6 eth0
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-' \
-  --run-command 'systemctl enable cloudphone-dhcp.service || true' \
+  --run-command 'touch /etc/cloud/cloud-init.disabled' \
+  --run-command 'systemctl disable cloud-init cloud-init-local cloud-config cloud-final cloud-init.target || true' \
+  --run-command 'systemctl mask cloud-init cloud-init-local cloud-config cloud-final || true' \
+  --run-command 'rm -f /etc/sysconfig/network-scripts/ifcfg-* || true' \
+  --run-command 'systemctl disable cloudphone-dhcp.service || true' \
+  --run-command 'rm -f /etc/systemd/system/cloudphone-dhcp.service || true' \
+  --run-command 'rm -f /etc/systemd/system/multi-user.target.wants/cloudphone-dhcp.service || true' \
   --run-command 'systemctl disable firewalld || true' \
   --write '/etc/NetworkManager/system-connections/cloudphone-eth0.nmconnection:[connection]
 id=cloudphone-eth0

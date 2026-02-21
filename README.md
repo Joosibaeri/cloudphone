@@ -25,8 +25,3 @@ IPv6
 -----
 - In `ipv6` mode, the VM still forwards SSH on IPv4 (e.g., `ssh -p <port> cloud@127.0.0.1`) and a socat helper bridges IPv6 connections to the same port. Use `ssh -6 -p <port> cloud@::1` for local IPv6.
 - Dynamic port allocation still uses IPv6-only bindings for the helper forwarder; ensure IPv6 clients can reach the server address printed by `serverip`.
-
-Network mode
-------------
-- `network_mode=bridge` (default) starts QEMU with a Linux bridge (`bridge_name`, default `br0`). This gives each VM its own network identity/IP (typically via DHCP) and you connect directly with `ssh cloud@<vm-ip>` on port 22.
-- `network_mode=user` keeps QEMU user-mode networking with host port forwarding.
