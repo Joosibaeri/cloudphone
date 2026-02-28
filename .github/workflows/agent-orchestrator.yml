@@ -1,0 +1,39 @@
+name: Agent – Orchestrator
+
+on:
+  # Run on a daily schedule to keep all agents active
+  schedule:
+    - cron: "0 6 * * *"
+  # Allow manual triggering with a task choice
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Which agent(s) to dispatch: code-review | issue-triage | all"
+        required: false
+        default: "all"
+
+jobs:
+  orchestrate:
+    name: Orchestrate coding agents
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: write  # needed to dispatch other workflows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run orchestrator agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          AGENT_TASK: ${{ github.event.inputs.task || 'all' }}
+        run: python agents/orchestrator.py
