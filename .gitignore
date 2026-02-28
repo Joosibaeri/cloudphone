@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build artifacts
+*.o
+*.a
+*.so
+
+# Editor directories
+.vscode/
