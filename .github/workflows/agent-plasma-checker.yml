@@ -1,0 +1,53 @@
+name: Agent – KDE Plasma Checker
+
+on:
+  # Triggered automatically on every pull-request that touches Qt/QML files
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "**.cpp"
+      - "**.cxx"
+      - "**.cc"
+      - "**.h"
+      - "**.hpp"
+      - "**.qml"
+      - "**.js"
+  # Can also be dispatched by the orchestrator or manually
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull-request number to check"
+        required: true
+
+jobs:
+  plasma-check:
+    name: KDE Plasma / Qt code check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ -n "${{ github.event.inputs.pr_number }}" ]; then
+            echo "number=${{ github.event.inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run KDE Plasma checker agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: python agents/plasma_checker.py

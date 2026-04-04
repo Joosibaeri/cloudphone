@@ -9,7 +9,7 @@ workflow_dispatch events via the GitHub REST API.
 Environment variables (provided by GitHub Actions):
   GITHUB_TOKEN  – token with `repo` + `workflow` scopes
   GITHUB_REPO   – owner/repo  (e.g. "Joosibaeri/cloudphone")
-  AGENT_TASK    – task to dispatch: "code-review" | "issue-triage" | "all"
+  AGENT_TASK    – task to dispatch: "code-review" | "issue-triage" | "plasma" | "all"
   EXTRA_INPUTS  – optional JSON string forwarded to the target workflow
 """
 
@@ -73,16 +73,24 @@ def run() -> None:
 
     print(f"[orchestrator] Starting – repo={repo}  task={task}")
 
-    if task in ("code-review", "all"):
+    if task in ("code-review", "plasma", "all"):
         open_prs = list_open_prs(repo)
         print(f"[orchestrator] Open PRs: {len(open_prs)}")
         for pr in open_prs:
-            dispatch_workflow(
-                repo,
-                "agent-code-review.yml",
-                ref="main",
-                inputs={"pr_number": str(pr["number"]), **extra_inputs},
-            )
+            if task in ("code-review", "all"):
+                dispatch_workflow(
+                    repo,
+                    "agent-code-review.yml",
+                    ref="main",
+                    inputs={"pr_number": str(pr["number"]), **extra_inputs},
+                )
+            if task in ("plasma", "all"):
+                dispatch_workflow(
+                    repo,
+                    "agent-plasma-checker.yml",
+                    ref="main",
+                    inputs={"pr_number": str(pr["number"]), **extra_inputs},
+                )
 
     if task in ("issue-triage", "all"):
         open_issues = [i for i in list_open_issues(repo) if "pull_request" not in i]

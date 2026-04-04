@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: "Which agent(s) to dispatch: code-review | issue-triage | all"
+        description: "Which agent(s) to dispatch: code-review | issue-triage | plasma | all"
         required: false
         default: "all"
 
